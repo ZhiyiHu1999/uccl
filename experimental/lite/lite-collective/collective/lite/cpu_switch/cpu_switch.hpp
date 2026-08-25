@@ -10,9 +10,9 @@
 
 namespace mscclpp::lite {
 
-/*
-Unified host-side CPU switch primitive, invoked by collective operations directly, 
-in the same style as NCCL Primitives.
+/**
+Unified host-side CPU switch primitive, invoked by collective operations
+directly, in the same style as NCCL Primitives.
 */
 template <typename T, typename RedOp = Sum<T>>
 class CpuSwitch : public CopyPrimitives<T>,

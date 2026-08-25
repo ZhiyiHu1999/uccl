@@ -4,7 +4,6 @@
 #pragma once
 
 #include "cuda_utils.hpp"
-
 #include <memory>
 #include <utility>
 
@@ -16,14 +15,12 @@ class Completion {
 
   static Completion record(cudaStream_t stream) {
     cudaEvent_t rawEvent = nullptr;
-    throwCudaError(
-      cudaEventCreateWithFlags(&rawEvent, cudaEventDisableTiming),
-      "CpuSwitch event creation");
+    throwCudaError(cudaEventCreateWithFlags(&rawEvent, cudaEventDisableTiming),
+                   "CpuSwitch event creation");
 
     auto event = std::make_shared<Event>(rawEvent);
-    throwCudaError(
-      cudaEventRecord(event->value, stream),
-      "CpuSwitch event record");
+    throwCudaError(cudaEventRecord(event->value, stream),
+                   "CpuSwitch event record");
     return Completion(std::move(event));
   }
 
@@ -54,7 +51,8 @@ class Completion {
     cudaEvent_t value = nullptr;
   };
 
-  explicit Completion(std::shared_ptr<Event> event) : event_(std::move(event)) {}
+  explicit Completion(std::shared_ptr<Event> event)
+      : event_(std::move(event)) {}
   std::shared_ptr<Event> event_;
 };
 

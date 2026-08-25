@@ -4,8 +4,8 @@
 #pragma once
 
 #include "completion.hpp"
+#include "numa_scope.hpp"
 #include "types.hpp"
-
 #include <cstring>
 #include <type_traits>
 
@@ -50,13 +50,14 @@ class CopyPrimitives {
     size_t bytes = destination.bytes();
     if constexpr (copy_detail::IsHostMemory<Src> &&
                   copy_detail::IsHostMemory<Dst>) {
+      NumaScope locality(destination.numaNode);
       std::memmove(destination.data, source.data, bytes);
       return {};
     } else {
-      throwCudaError(cudaMemcpyAsync(destination.data, source.data, bytes,
-                                     copy_detail::cudaCopyKind<Src, Dst>(),
-                                     stream),
-                     "CpuSwitch copy");
+      throwCudaError(
+          cudaMemcpyAsync(destination.data, source.data, bytes,
+                          copy_detail::cudaCopyKind<Src, Dst>(), stream),
+          "CpuSwitch copy");
       return Completion::record(stream);
     }
   }
@@ -75,6 +76,7 @@ class CopyPrimitives {
     size_t width = source.columnCount * sizeof(T);
     if constexpr (copy_detail::IsHostMemory<Src> &&
                   copy_detail::IsHostMemory<Dst>) {
+      NumaScope locality(destination.numaNode);
       for (size_t row = 0; row < source.rowCount; ++row) {
         std::memmove(destination.data + row * destination.stride,
                      source.data + row * source.stride, width);
@@ -103,8 +105,10 @@ class CopyPrimitives {
 
   template <typename RowT>
   static void checkRows(Rows<RowT> rows) {
-    // Each row (allows padding) must fit within its stride, and non-empty rows need valid data.
-    if (rows.stride < rows.columnCount || (rows.data == nullptr && rows.rowCount * rows.columnCount != 0)) {
+    // Each row (allows padding) must fit within its stride, and non-empty rows
+    // need valid data.
+    if (rows.stride < rows.columnCount ||
+        (rows.data == nullptr && rows.rowCount * rows.columnCount != 0)) {
       throw std::invalid_argument("CpuSwitch rows are invalid");
     }
   }

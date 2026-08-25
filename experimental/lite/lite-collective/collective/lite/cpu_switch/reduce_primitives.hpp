@@ -4,8 +4,8 @@
 #pragma once
 
 #include "cpu_reduction.hpp"
+#include "numa_scope.hpp"
 #include "types.hpp"
-
 #include <type_traits>
 #include <vector>
 
@@ -47,6 +47,7 @@ class ReducePrimitives {
   // Element-wise reduction of all contiguous input spans into output.
   void reduce(std::vector<Span<T const>> const& inputs, Span<T> output) const {
     checkReduction(inputs, output);
+    NumaScope locality(output.numaNode);
     if constexpr (reduce_detail::IsFloatSum<T, RedOp>::value) {
       std::vector<float const*> pointers(inputs.size());
       for (size_t i = 0; i < inputs.size(); ++i) {
@@ -85,15 +86,13 @@ class ReducePrimitives {
   */
   void reduceTwoRows(std::vector<Rows<T const>> const& inputs,
                      size_t firstTarget, Span<T> firstOutput,
-                     size_t secondTarget,
-                     Span<T> secondOutput) const {
+                     size_t secondTarget, Span<T> secondOutput) const {
     if (inputs.empty()) {
       throw std::invalid_argument("CpuSwitch reduction needs an input");
     }
     if ((firstOutput.data == nullptr && firstOutput.count != 0) ||
         (secondOutput.data == nullptr && secondOutput.count != 0)) {
-      throw std::invalid_argument(
-          "CpuSwitch two-row reduction output is null");
+      throw std::invalid_argument("CpuSwitch two-row reduction output is null");
     }
     for (size_t source = 0; source < inputs.size(); ++source) {
       auto const& input = inputs[source];
@@ -107,6 +106,7 @@ class ReducePrimitives {
       }
     }
     if constexpr (reduce_detail::IsFloatSum<T, RedOp>::value) {
+      NumaScope locality(firstOutput.numaNode);
       std::vector<float const*> pointers(inputs.size());
       for (size_t source = 0; source < inputs.size(); ++source) {
         pointers[source] = inputs[source].data;
@@ -125,11 +125,12 @@ class ReducePrimitives {
     if (accumulator.count != input.count ||
         (accumulator.data == nullptr && accumulator.count != 0) ||
         (input.data == nullptr && input.count != 0)) {
-      throw std::invalid_argument("CpuSwitch in-place reduction shape mismatch");
+      throw std::invalid_argument(
+          "CpuSwitch in-place reduction shape mismatch");
     }
     std::vector<Span<T const>> inputs{
-        Span<T const>{accumulator.data, accumulator.count,
-                      accumulator.numaNode, accumulator.device},
+        Span<T const>{accumulator.data, accumulator.count, accumulator.numaNode,
+                      accumulator.device},
         input};
     reduce(inputs, accumulator);
   }
