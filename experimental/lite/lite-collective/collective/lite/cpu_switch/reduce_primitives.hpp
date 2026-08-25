@@ -105,6 +105,11 @@ class ReducePrimitives {
             "CpuSwitch two-row reduction shape mismatch");
       }
     }
+    if (firstOutput.numaNode != secondOutput.numaNode) {
+      reduceRows(inputs, firstTarget, firstOutput);
+      reduceRows(inputs, secondTarget, secondOutput);
+      return;
+    }
     if constexpr (reduce_detail::IsFloatSum<T, RedOp>::value) {
       NumaScope locality(firstOutput.numaNode);
       std::vector<float const*> pointers(inputs.size());

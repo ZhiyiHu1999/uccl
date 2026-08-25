@@ -3280,13 +3280,6 @@ void reduceSmallPartialsScalar(float const* rank0, float const* rank1,
   }
 }
 
-void addSmallPartialsScalar(float* output, float const* remoteIncoming,
-                            size_t count) {
-  for (size_t i = 0; i < count; ++i) {
-    output[i] += remoteIncoming[i];
-  }
-}
-
 void reduceSmallPartialsTwoLocalScalar(float const* rank0, float const* rank1,
                                        size_t localElemOffset,
                                        size_t remoteElemOffset,
@@ -3341,18 +3334,6 @@ void reduceSmallPartialsAvx512(float const* rank0, float const* rank1,
   reduceSmallPartialsScalar(rank0, rank1, rank2, rank3, localElemOffset + i,
                             remoteElemOffset + i, localPartial + i,
                             remotePartial + i, count - i);
-}
-
-__attribute__((target("avx512f")))
-void addSmallPartialsAvx512(float* output, float const* remoteIncoming,
-                            size_t count) {
-  size_t i = 0;
-  for (; i + 16 <= count; i += 16) {
-    auto lhs = *reinterpret_cast<Avx512Float const*>(output + i);
-    auto rhs = *reinterpret_cast<Avx512Float const*>(remoteIncoming + i);
-    *reinterpret_cast<Avx512Float*>(output + i) = lhs + rhs;
-  }
-  addSmallPartialsScalar(output + i, remoteIncoming + i, count - i);
 }
 
 __attribute__((target("avx512f")))
@@ -3426,17 +3407,6 @@ void reduceSmallPartials(float const* rank0, float const* rank1,
   reduceSmallPartialsScalar(rank0, rank1, rank2, rank3, localElemOffset,
                             remoteElemOffset, localPartial, remotePartial,
                             count);
-}
-
-void addSmallPartials(float* output, float const* remoteIncoming,
-                      size_t count) {
-#if defined(__x86_64__) && defined(__GNUC__)
-  if (count >= 2048 && hasAvx512F()) {
-    addSmallPartialsAvx512(output, remoteIncoming, count);
-    return;
-  }
-#endif
-  addSmallPartialsScalar(output, remoteIncoming, count);
 }
 
 void reduceSmallPartialsTwoLocal(float const* rank0, float const* rank1,
@@ -4248,7 +4218,9 @@ ncclResult_t runTwoRankSmallHostReduceScatter(RsContext& ctx,
   auto* output = reinterpret_cast<float*>(recvSlot + localOffset);
   auto const* remoteIncoming =
       reinterpret_cast<float const*>(recvSlot + 2 * bytesPerRank);
-  addSmallPartials(output, remoteIncoming, recvcount);
+  mscclpp::lite::CpuSwitch<float, mscclpp::lite::Sum<float>> cpuSwitch;
+  cpuSwitch.reduceInPlace({output, recvcount, ctx.numaNode, -1},
+                          {remoteIncoming, recvcount, ctx.numaNode, -1});
 
   MSCCLPP_CUDATHROW(cudaMemcpyAsync(recvbuff, output, bytesPerRank,
                                     cudaMemcpyHostToDevice, stream));
@@ -4781,7 +4753,9 @@ ncclResult_t completeChunkRemote(RsContext& ctx, void* recvbuff,
         reinterpret_cast<float*>(ctx.smallRecvSlab + work.pairSlotOffset);
     auto const* remoteHost =
         reinterpret_cast<float const*>(ctx.recvSlab + work.pairSlotOffset);
-    addSmallPartials(localHost, remoteHost, work.chunkElems);
+    mscclpp::lite::CpuSwitch<float, mscclpp::lite::Sum<float>> cpuSwitch;
+    cpuSwitch.reduceInPlace({localHost, work.chunkElems, ctx.numaNode, -1},
+                            {remoteHost, work.chunkElems, ctx.numaNode, -1});
     MSCCLPP_CUDATHROW(cudaMemcpyAsync(outputGpu, localHost, work.chunkBytes,
                                       cudaMemcpyHostToDevice, stream));
     waitForCudaStream(stream);

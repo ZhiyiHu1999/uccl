@@ -137,6 +137,7 @@ struct NativeReduceScatterHostContext {
   int localLeader = -1;
   int remoteLeader = -1;
   int cudaDevice = -1;
+  int numaNode = -1;
   size_t maxShardBytes = kNativeReduceScatterHostMaxShardBytes;
   size_t inputCapacity = 0;
   size_t partialBlockCapacity = 0;
@@ -431,6 +432,7 @@ void placeReduceScatterPartialSlotsOnNuma(NativeReduceScatterHostContext& ctx) {
   } catch (...) {
     return;
   }
+  ctx.numaNode = gpuNuma;
   if (gpuNuma < 0 || numa_available() < 0) return;
 
   auto place = [&](char* ptr, size_t bytes) {
@@ -1666,7 +1668,7 @@ ncclResult_t runHostStagedReduceScatter2Node(
             {static_cast<float const*>(sendbuff), inputBytes / sizeof(float),
              -1, cudaDevice},
             {reinterpret_cast<float*>(localInput), inputBytes / sizeof(float),
-             -1, -1},
+             ctx.numaNode, -1},
             stream)
         .wait();
     cpuSwitch.publishEpoch(ctx.ctrl->d2hReady[ctx.localRank], epoch);
@@ -1692,9 +1694,9 @@ ncclResult_t runHostStagedReduceScatter2Node(
     }
     cpuSwitch.reduceTwoRows(
         localRankRows, static_cast<size_t>(localBase + ctx.localRank),
-        {localPartial, recvcount, -1, -1},
+        {localPartial, recvcount, ctx.numaNode, -1},
         static_cast<size_t>(remoteBase + ctx.localRank),
-        {remotePartial, recvcount, -1, -1});
+        {remotePartial, recvcount, ctx.numaNode, -1});
     cpuSwitch.publishEpoch(ctx.ctrl->partialReady[ctx.localRank], epoch);
 
     if (ctx.isLeader) {
@@ -1737,13 +1739,13 @@ ncclResult_t runHostStagedReduceScatter2Node(
     auto* remoteIncoming = reinterpret_cast<float*>(
         ctx.recvPartialSlab() +
         static_cast<size_t>(ctx.localRank) * bytesPerRank);
-    cpuSwitch.reduceInPlace({localPartial, recvcount, -1, -1},
-                            {remoteIncoming, recvcount, -1, -1});
+    cpuSwitch.reduceInPlace({localPartial, recvcount, ctx.numaNode, -1},
+                            {remoteIncoming, recvcount, ctx.numaNode, -1});
 
     cpuSwitch
         .copy<mscclpp::lite::MemoryType::HostMapped,
               mscclpp::lite::MemoryType::Device, float const>(
-            {localPartial, recvcount, -1, -1},
+            {localPartial, recvcount, ctx.numaNode, -1},
             {static_cast<float*>(recvbuff), recvcount, -1, cudaDevice}, stream)
         .wait();
     cpuSwitch.publishEpoch(ctx.ctrl->h2dDone[ctx.localRank], epoch);
