@@ -2507,7 +2507,7 @@ NCCL_API ncclResult_t ncclGroupEnd() {
       commView.hasIB = opComm->hasIB;
     }
     bool handledOptimizedRemote =
-        tryExecuteOptimizedGroupedAllToAll(commView, ops, optimizedResult);
+        tryExecuteOptimizedGroupedAllToAll(commView, ops, optimizedResult);  // only execute remote ops
     if (handledOptimizedRemote && optimizedResult != ncclSuccess) {
       return optimizedResult;
     }
@@ -2537,10 +2537,11 @@ NCCL_API ncclResult_t ncclGroupEnd() {
       return ncclInvalidUsage;
     }
     for (size_t i = 0; i < selfSends.size(); ++i) {
-      ncclResult_t result = executeSelfGroupedP2POp(selfSends[i], selfRecvs[i]);
+      ncclResult_t result = executeSelfGroupedP2POp(selfSends[i], selfRecvs[i]);  // self-pair
       if (result != ncclSuccess) return result;
     }
     ops = std::move(nonSelfOps);
+    nonSelfOps.clear();
   }
 
   // Phase 1: Pre-initialize all needed peer contexts (sorted by peer rank
