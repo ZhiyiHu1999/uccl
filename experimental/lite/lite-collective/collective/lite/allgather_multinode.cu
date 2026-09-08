@@ -618,9 +618,10 @@ void signalRdmaReadyAtomic(AgContext& ctx,
                            mscclpp::RegisteredMemory remoteCtrlMemory,
                            int peerNode, uint64_t epoch) {
   uint64_t& publishedEpoch = ctx.rdmaReadyAtomicEpoch[peerNode];
-  connection.updateAndSync(remoteCtrlMemory, rdmaReadyOffset(ctx.nodeId),
-                           &publishedEpoch, epoch);
-  connection.flush();
+  mscclpp::lite::CpuSwitch<char>{}.rdmaSignal(
+      connection, remoteCtrlMemory, rdmaReadyOffset(ctx.nodeId),
+      &publishedEpoch, epoch);
+  mscclpp::lite::CpuSwitch<char>{}.rdmaFlush(connection);
 }
 
 void signalRdmaReadyAtomic(AgContext& ctx, size_t peer, uint64_t epoch) {
@@ -633,11 +634,12 @@ void writeOrderedSlot(AgContext& ctx, size_t dataOffset, size_t flagOffset,
                        size_t dataBytes) {
   size_t flagSrcOffset = rdmaSignalOffset(ctx.nodeId);
   if (!ctx.smallQp || ctx.smallSendMr == nullptr || ctx.smallCtrlMr == nullptr) {
-    ctx.connection.write(ctx.remoteSendMemory, dataOffset, ctx.sendMemory,
-                         dataOffset, dataBytes);
-    ctx.connection.write(ctx.remoteSendMemory, flagOffset, ctx.ctrlMemory,
-                         flagSrcOffset, sizeof(uint64_t));
-    ctx.connection.flush();
+    mscclpp::lite::CpuSwitch<char> cpuSwitch;
+    cpuSwitch.rdmaWrite(ctx.connection, ctx.remoteSendMemory, dataOffset,
+                        ctx.sendMemory, dataOffset, dataBytes);
+    cpuSwitch.rdmaWriteAndFlush(
+        ctx.connection, ctx.remoteSendMemory, flagOffset, ctx.ctrlMemory,
+        flagSrcOffset, sizeof(uint64_t));
     return;
   }
   bool signaled = (++ctx.smallWrCount % kSmallSignalEvery) == 0;
@@ -654,9 +656,9 @@ void writeOrderedSlot(AgContext& ctx, size_t dataOffset, size_t flagOffset,
 void writeCompactSlot(AgContext& ctx, size_t segmentOffset,
                       size_t segmentBytes) {
   if (!ctx.smallQp || ctx.smallSendMr == nullptr) {
-    ctx.connection.write(ctx.remoteSendMemory, segmentOffset, ctx.sendMemory,
-                         segmentOffset, segmentBytes);
-    ctx.connection.flush();
+    mscclpp::lite::CpuSwitch<char>{}.rdmaWriteAndFlush(
+        ctx.connection, ctx.remoteSendMemory, segmentOffset, ctx.sendMemory,
+        segmentOffset, segmentBytes);
     return;
   }
   bool signaled = (++ctx.smallWrCount % kSmallSignalEvery) == 0;
@@ -696,10 +698,9 @@ bool writeDataStripedToRemoteRecv(AgContext& ctx, size_t remoteBase,
   if (!writeDataDirectToRemoteRecv(ctx, remoteBase, sendBase, rail1Bytes)) {
     return false;
   }
-  ctx.rail2Connection.write(ctx.rail2RemoteRecvMemory,
-                            remoteBase + rail1Bytes, ctx.rail2SendMemory,
-                            sendBase + rail1Bytes, rail2Bytes);
-  ctx.rail2Connection.flush();
+  mscclpp::lite::CpuSwitch<char>{}.rdmaWriteAndFlush(
+      ctx.rail2Connection, ctx.rail2RemoteRecvMemory, remoteBase + rail1Bytes,
+      ctx.rail2SendMemory, sendBase + rail1Bytes, rail2Bytes);
   return true;
 }
 

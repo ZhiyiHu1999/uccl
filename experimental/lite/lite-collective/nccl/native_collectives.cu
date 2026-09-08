@@ -1660,21 +1660,20 @@ ncclResult_t runHostStagedReduceScatter2Node(
         size_t chunk =
             std::min(kNativeReduceScatterRdmaChunkBytes,
                      partialBlockBytes - off);
-        ctx.connection.write(ctx.remoteRecvPartialMemory, off,
-                             ctx.sendPartialMemory, off, chunk);
+        cpuSwitch.rdmaWrite(ctx.connection, ctx.remoteRecvPartialMemory, off,
+                            ctx.sendPartialMemory, off, chunk);
         if (++writesSinceFlush == kNativeReduceScatterSignalEveryN) {
-          ctx.connection.flush();
+          cpuSwitch.rdmaFlush(ctx.connection);
           writesSinceFlush = 0;
         }
         off += chunk;
       }
       cpuSwitch.publishEpoch(ctx.ctrl->rdmaSignal, epoch);
-      ctx.connection.write(
-          ctx.remoteCtrlMemory,
+      cpuSwitch.rdmaWriteAndFlush(
+          ctx.connection, ctx.remoteCtrlMemory,
           offsetof(NativeReduceScatterHostControl, rdmaReady), ctx.ctrlMemory,
           offsetof(NativeReduceScatterHostControl, rdmaSignal),
           sizeof(uint64_t));
-      ctx.connection.flush();
     }
     cpuSwitch.waitEpoch(ctx.ctrl->rdmaReady, epoch);
 
@@ -1697,12 +1696,11 @@ ncclResult_t runHostStagedReduceScatter2Node(
     }
     if (ctx.isLeader) {
       cpuSwitch.publishEpoch(ctx.ctrl->ackSignal, epoch);
-      ctx.connection.write(
-          ctx.remoteCtrlMemory,
+      cpuSwitch.rdmaWriteAndFlush(
+          ctx.connection, ctx.remoteCtrlMemory,
           offsetof(NativeReduceScatterHostControl, ackReady), ctx.ctrlMemory,
           offsetof(NativeReduceScatterHostControl, ackSignal),
           sizeof(uint64_t));
-      ctx.connection.flush();
     }
     return ncclSuccess;
   } catch (std::exception const& ex) {
@@ -2331,13 +2329,14 @@ ncclResult_t runSmallMappedAllReduce2Node(
         offsetof(NativeReduceScatterHostControl, smallRdmaReady);
     size_t smallRdmaSignalOffset =
         offsetof(NativeReduceScatterHostControl, smallRdmaSignal);
-    ctx.pairConnection.write(ctx.pairRemoteRecvPartialMemory, partialOffset,
-                             ctx.sendPartialMemory, partialOffset, bytes);
+    mscclpp::lite::CpuSwitch<char> rdmaSwitch;
+    rdmaSwitch.rdmaWrite(ctx.pairConnection, ctx.pairRemoteRecvPartialMemory,
+                         partialOffset, ctx.sendPartialMemory, partialOffset,
+                         bytes);
     ctx.ctrl->smallRdmaSignal.store(epoch, std::memory_order_release);
-    ctx.pairConnection.write(ctx.pairRemoteCtrlMemory, smallRdmaReadyOffset,
-                             ctx.ctrlMemory, smallRdmaSignalOffset,
-                             sizeof(uint64_t));
-    ctx.pairConnection.flush();
+    rdmaSwitch.rdmaWriteAndFlush(
+        ctx.pairConnection, ctx.pairRemoteCtrlMemory, smallRdmaReadyOffset,
+        ctx.ctrlMemory, smallRdmaSignalOffset, sizeof(uint64_t));
     waitForEpoch(ctx.ctrl->smallRdmaReady, epoch);
 
     auto* local = reinterpret_cast<float*>(localPartial);
@@ -2419,14 +2418,15 @@ ncclResult_t runSmallTwoLeaderAllReduce2Node(
           offsetof(NativeReduceScatterHostControl, smallPairRdmaSignal) +
           static_cast<size_t>(localRank) *
               sizeof(ctx.ctrl->smallPairRdmaSignal[0]);
-      ctx.pairConnection.write(ctx.pairRemoteRecvPartialMemory, partialOffset,
-                               ctx.sendPartialMemory, partialOffset, halfBytes);
+      mscclpp::lite::CpuSwitch<char> rdmaSwitch;
+      rdmaSwitch.rdmaWrite(ctx.pairConnection,
+                           ctx.pairRemoteRecvPartialMemory, partialOffset,
+                           ctx.sendPartialMemory, partialOffset, halfBytes);
       ctx.ctrl->smallPairRdmaSignal[localRank].store(
           epoch, std::memory_order_release);
-      ctx.pairConnection.write(ctx.pairRemoteCtrlMemory, rdmaReadyOffset,
-                               ctx.ctrlMemory, rdmaSignalOffset,
-                               sizeof(uint64_t));
-      ctx.pairConnection.flush();
+      rdmaSwitch.rdmaWriteAndFlush(
+          ctx.pairConnection, ctx.pairRemoteCtrlMemory, rdmaReadyOffset,
+          ctx.ctrlMemory, rdmaSignalOffset, sizeof(uint64_t));
       waitForEpoch(ctx.ctrl->smallPairRdmaReady[localRank], epoch);
       mscclpp::lite::CpuSwitch<float>{}.reduce(
           {{reinterpret_cast<float const*>(localPartial), halfCount},

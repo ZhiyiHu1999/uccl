@@ -3185,12 +3185,13 @@ void postSmallDataAndSignal(RsContext& ctx, size_t remoteDataOffset,
                             size_t localSignalOffset) {
   if (usePairConnectionWrite() || !ctx.smallQp || ctx.smallRecvMr == nullptr ||
       ctx.smallCtrlMr == nullptr) {
-    ctx.pairConnection.write(ctx.remoteSmallRecvMemory, remoteDataOffset,
-                             ctx.smallRecvMemory, localDataOffset, bytes);
-    ctx.pairConnection.write(ctx.remoteCtrlMemory, remoteSignalOffset,
-                             ctx.ctrlMemory, localSignalOffset,
-                             sizeof(uint64_t));
-    ctx.pairConnection.flush();
+    mscclpp::lite::CpuSwitch<char> cpuSwitch;
+    cpuSwitch.rdmaWrite(ctx.pairConnection, ctx.remoteSmallRecvMemory,
+                        remoteDataOffset, ctx.smallRecvMemory, localDataOffset,
+                        bytes);
+    cpuSwitch.rdmaWriteAndFlush(
+        ctx.pairConnection, ctx.remoteCtrlMemory, remoteSignalOffset,
+        ctx.ctrlMemory, localSignalOffset, sizeof(uint64_t));
     return;
   }
   bool signaled = (++ctx.smallWrCount % kSmallSignalEveryN) == 0;
@@ -3210,12 +3211,13 @@ void postPairDataAndSignal(RsContext& ctx, size_t remoteDataOffset,
                            size_t localSignalOffset) {
   if (usePairConnectionWrite() || !ctx.smallQp || ctx.sendMr == nullptr ||
       ctx.smallCtrlMr == nullptr) {
-    ctx.pairConnection.write(ctx.remoteRecvMemory, remoteDataOffset,
-                             ctx.sendMemory, localDataOffset, bytes);
-    ctx.pairConnection.write(ctx.remoteCtrlMemory, remoteSignalOffset,
-                             ctx.ctrlMemory, localSignalOffset,
-                             sizeof(uint64_t));
-    ctx.pairConnection.flush();
+    mscclpp::lite::CpuSwitch<char> cpuSwitch;
+    cpuSwitch.rdmaWrite(ctx.pairConnection, ctx.remoteRecvMemory,
+                        remoteDataOffset, ctx.sendMemory, localDataOffset,
+                        bytes);
+    cpuSwitch.rdmaWriteAndFlush(
+        ctx.pairConnection, ctx.remoteCtrlMemory, remoteSignalOffset,
+        ctx.ctrlMemory, localSignalOffset, sizeof(uint64_t));
     return;
   }
   bool signaled = (++ctx.smallWrCount % kPairSignalEveryN) == 0;
@@ -3233,10 +3235,9 @@ void postSmallSignal(RsContext& ctx, size_t remoteSignalOffset,
                      size_t localSignalOffset,
                      int signalEvery = kSmallSignalEveryN) {
   if (!ctx.smallQp || ctx.smallCtrlMr == nullptr) {
-    ctx.pairConnection.write(ctx.remoteCtrlMemory, remoteSignalOffset,
-                             ctx.ctrlMemory, localSignalOffset,
-                             sizeof(uint64_t));
-    ctx.pairConnection.flush();
+    mscclpp::lite::CpuSwitch<char>{}.rdmaWriteAndFlush(
+        ctx.pairConnection, ctx.remoteCtrlMemory, remoteSignalOffset,
+        ctx.ctrlMemory, localSignalOffset, sizeof(uint64_t));
     return;
   }
   bool signaled = (++ctx.smallWrCount % signalEvery) == 0;
