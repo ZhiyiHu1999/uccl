@@ -25,6 +25,7 @@
 #include "algorithm.hpp"
 #include "algorithm_selector.hpp"
 #include "allgather.hpp"
+#include "gpu_collectives.cuh"
 #include "allreduce.hpp"
 #include "alltoall.hpp"
 #include "broadcast.hpp"
@@ -1324,6 +1325,129 @@ static NcclSendRecvPeerContext& getSendRecvPeerContext(ncclComm_t comm,
 
 #include "../collective/lite/allgather_intranode.cu"
 
+namespace {
+
+struct DeviceAllGatherContext {
+  std::mutex mutex;
+  std::unique_ptr<HostStagingBuffer> buffer;
+  unsigned long long* localEpoch = nullptr;
+  size_t maxBytesPerRank = 0;
+  int rank = -1;
+  int nranks = 0;
+  int cudaDevice = -1;
+
+  ~DeviceAllGatherContext() {
+    if (localEpoch != nullptr) {
+      int previousDevice = -1;
+      cudaGetDevice(&previousDevice);
+      if (cudaDevice >= 0) cudaSetDevice(cudaDevice);
+      cudaFree(localEpoch);
+      buffer.reset();
+      if (previousDevice >= 0 && previousDevice != cudaDevice) {
+        cudaSetDevice(previousDevice);
+      }
+    }
+  }
+};
+
+static std::mutex gDeviceAllGatherContextMutex;
+static std::unordered_map<ncclComm_t, std::unique_ptr<DeviceAllGatherContext>>
+    gDeviceAllGatherContexts;
+
+static void cleanupDeviceAllGatherContext(ncclComm_t comm) {
+  std::lock_guard<std::mutex> lock(gDeviceAllGatherContextMutex);
+  gDeviceAllGatherContexts.erase(comm);
+}
+
+}  // namespace
+
+NCCL_API ncclResult_t mscclppGetDeviceAllGatherHandle(
+    ncclComm_t comm, size_t maxBytesPerRank,
+    mscclppDeviceAllGatherHandle_t* handle) {
+  if (comm == nullptr || handle == nullptr || maxBytesPerRank == 0) {
+    return ncclInvalidArgument;
+  }
+
+  int rank = comm->comm->bootstrap()->getRank();
+  int nranks = comm->comm->bootstrap()->getNranks();
+  if (nranks < 2 || nranks > MSCCLPP_DEVICE_ALLGATHER_MAX_RANKS ||
+      nranks != comm->nRanksPerNode) {
+    return ncclInvalidUsage;
+  }
+  if (maxBytesPerRank >
+      std::numeric_limits<size_t>::max() /
+          (static_cast<size_t>(nranks) *
+           MSCCLPP_DEVICE_ALLGATHER_SLOTS)) {
+    return ncclInvalidArgument;
+  }
+
+  return runNcclGuarded("device AllGather handle initialization", [&]() {
+    mscclpp::CudaDeviceGuard deviceGuard(comm->cudaDevice);
+    DeviceAllGatherContext* context = nullptr;
+    {
+      std::lock_guard<std::mutex> mapLock(gDeviceAllGatherContextMutex);
+      auto& entry = gDeviceAllGatherContexts[comm];
+      if (!entry) entry = std::make_unique<DeviceAllGatherContext>();
+      context = entry.get();
+    }
+
+    std::lock_guard<std::mutex> contextLock(context->mutex);
+    if (!context->buffer) {
+      try {
+        size_t alignedMaxBytesPerRank =
+            (maxBytesPerRank + 15U) & ~static_cast<size_t>(15U);
+        auto nc = static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(comm));
+        char tagBuffer[64];
+        std::snprintf(tagBuffer, sizeof(tagBuffer), "device_%d_%llx", getpid(),
+                      nc);
+        context->buffer = std::make_unique<HostStagingBuffer>(
+            HostStagingBuffer::create(
+                alignedMaxBytesPerRank, MSCCLPP_DEVICE_ALLGATHER_SLOTS,
+                comm->comm,
+                rank, nranks, comm->cudaDevice, /*mapSlab=*/true,
+                hostAllGatherNumaPlacementEnabled(), tagBuffer));
+        MSCCLPP_CUDATHROW(cudaMalloc(&context->localEpoch,
+                                    sizeof(*context->localEpoch)));
+        MSCCLPP_CUDATHROW(cudaMemset(context->localEpoch, 0,
+                                    sizeof(*context->localEpoch)));
+      } catch (...) {
+        if (context->localEpoch != nullptr) {
+          cudaFree(context->localEpoch);
+          context->localEpoch = nullptr;
+        }
+        context->buffer.reset();
+        throw;
+      }
+      context->maxBytesPerRank = maxBytesPerRank;
+      context->rank = rank;
+      context->nranks = nranks;
+      context->cudaDevice = comm->cudaDevice;
+      comm->comm->bootstrap()->barrier();
+    } else if (context->maxBytesPerRank != maxBytesPerRank) {
+      throw mscclpp::Error(
+          "device AllGather handle was already initialized with a different "
+          "maxBytesPerRank",
+          mscclpp::ErrorCode::InvalidUsage);
+    }
+
+    CscDeviceHandle raw = context->buffer->deviceHandle();
+    if (raw.slabDev == nullptr || raw.ctrlDev == nullptr) {
+      throw mscclpp::Error(
+          "device AllGather requires GPU-mapped shared host memory",
+          mscclpp::ErrorCode::InvalidUsage);
+    }
+    handle->slab = raw.slabDev;
+    handle->control = raw.ctrlDev;
+    handle->localEpoch = context->localEpoch;
+    handle->maxBytesPerRank = raw.bytesPerRank;
+    handle->slotStride = raw.slotStride;
+    handle->counterStride = raw.counterStride;
+    handle->rank = raw.rank;
+    handle->nranks = raw.nRanks;
+  });
+}
+
 static ncclResult_t executeGroupedCudaIpcRecvEventImpl(
     void* recvbuff, size_t count, ncclDataType_t datatype, int peer,
     ncclComm_t comm, cudaStream_t stream) {
@@ -1873,6 +1997,7 @@ NCCL_API ncclResult_t ncclCommDestroy(ncclComm_t comm) {
   cleanupAllToAllContexts(comm);
   cleanupHostAllGatherContexts(comm);
   cleanupGpuAllGatherContexts(comm);
+  cleanupDeviceAllGatherContext(comm);
   mscclpp::nccl::cleanupNativeCollectiveContexts(comm);
   delete comm;
   return ncclSuccess;
