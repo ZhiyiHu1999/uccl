@@ -33,6 +33,7 @@
 #include "ib.hpp"
 #include "logger.hpp"
 #include "lite_common.h"
+#include "lite/cpu_switch/cpu_switch.hpp"
 #include "memory_channel.hpp"
 #include "native_collectives.hpp"
 #include "nccl.h"
@@ -691,7 +692,8 @@ inline ncclResult_t mapMscclppException(std::exception const& ex) {
     }
   }
   if (dynamic_cast<mscclpp::CudaError const*>(&ex) != nullptr ||
-      dynamic_cast<mscclpp::CuError const*>(&ex) != nullptr) {
+      dynamic_cast<mscclpp::CuError const*>(&ex) != nullptr ||
+      dynamic_cast<mscclpp::lite::CudaOperationError const*>(&ex) != nullptr) {
     return ncclUnhandledCudaError;
   }
   return ncclInternalError;
@@ -2308,7 +2310,7 @@ NCCL_API ncclResult_t ncclReduceScatter(void const* sendbuff, void* recvbuff,
     }
   }
 
-  ncclResult_t nativeResult = mscclpp::nccl::runLiteInterReduceScatter(
+  ncclResult_t nativeResult = mscclpp::nccl::runLiteInterReduceScatter(  // Seems redundant
       sendbuff, recvbuff, recvcount, bytes, datatype, op, comm, stream, rank,
       nRank, comm->scratchBuffer_.get(), comm->scratchBufferSize_,
       comm->nRanksPerNode, comm->comm, comm->cudaDevice);
@@ -2539,6 +2541,7 @@ NCCL_API ncclResult_t ncclGroupEnd() {
       if (result != ncclSuccess) return result;
     }
     ops = std::move(nonSelfOps);
+    // nonSelfOps.clear();
   }
 
   // Phase 1: Pre-initialize all needed peer contexts (sorted by peer rank
