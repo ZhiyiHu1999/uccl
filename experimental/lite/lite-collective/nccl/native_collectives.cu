@@ -1,4 +1,5 @@
 #include "native_collectives.hpp"
+#include "lite/cpu_switch/cpu_switch.hpp"
 #include "debug.h"
 #include "env.hpp"
 #include "gpu_utils.hpp"
@@ -287,7 +288,8 @@ ncclResult_t mapNativeException(std::exception const& ex) {
     }
   }
   if (dynamic_cast<mscclpp::CudaError const*>(&ex) != nullptr ||
-      dynamic_cast<mscclpp::CuError const*>(&ex) != nullptr) {
+      dynamic_cast<mscclpp::CuError const*>(&ex) != nullptr ||
+      dynamic_cast<mscclpp::lite::CudaOperationError const*>(&ex) != nullptr) {
     return ncclUnhandledCudaError;
   }
   return ncclInternalError;
@@ -740,37 +742,6 @@ void ensureReduceScatterLocalScratchIpc(
   ctx.localScratchIpcReady = true;
 }
 
-void reduceFloatShardFromHost(char const* __restrict__ sendSlab,
-                              size_t inputStride, size_t bytesPerRank,
-                              int nRanksPerNode, int targetRank,
-                              size_t recvcount, float* __restrict__ dst) {
-  size_t targetOffset = static_cast<size_t>(targetRank) * bytesPerRank;
-  if (nRanksPerNode == 4) {
-    auto const* __restrict__ src0 =
-        reinterpret_cast<float const*>(sendSlab + targetOffset);
-    auto const* __restrict__ src1 = reinterpret_cast<float const*>(
-        sendSlab + inputStride + targetOffset);
-    auto const* __restrict__ src2 = reinterpret_cast<float const*>(
-        sendSlab + 2 * inputStride + targetOffset);
-    auto const* __restrict__ src3 = reinterpret_cast<float const*>(
-        sendSlab + 3 * inputStride + targetOffset);
-#pragma GCC ivdep
-    for (size_t i = 0; i < recvcount; ++i) {
-      dst[i] = src0[i] + src1[i] + src2[i] + src3[i];
-    }
-    return;
-  }
-
-  auto const* first = reinterpret_cast<float const*>(sendSlab + targetOffset);
-  std::memcpy(dst, first, recvcount * sizeof(float));
-  for (int local = 1; local < nRanksPerNode; ++local) {
-    auto const* src = reinterpret_cast<float const*>(
-        sendSlab + static_cast<size_t>(local) * inputStride + targetOffset);
-#pragma GCC ivdep
-    for (size_t i = 0; i < recvcount; ++i) dst[i] += src[i];
-  }
-}
-
 template <typename T>
 __global__ void reduceRowsKernel(char const* rows, void* output, size_t count,
                                  size_t rowBytes, int nRows, ncclRedOp_t op) {
@@ -877,85 +848,27 @@ __global__ void smallAllReduceMappedFloatKernel(
   }
 }
 
-__attribute__((target("avx512f")))
-void reduce4SmallFloatRowsAvx512Range(char const* inputBase, size_t inputStride,
-                                      float* output, size_t vecBegin,
-                                      size_t vecEnd) {
-  using Vec = float __attribute__((vector_size(64)));
-  auto const* row0 = reinterpret_cast<float const*>(inputBase);
-  auto const* row1 =
-      reinterpret_cast<float const*>(inputBase + inputStride);
-  auto const* row2 =
-      reinterpret_cast<float const*>(inputBase + 2 * inputStride);
-  auto const* row3 =
-      reinterpret_cast<float const*>(inputBase + 3 * inputStride);
-  for (size_t vec = vecBegin; vec < vecEnd; ++vec) {
-    size_t i = vec * 16;
-    Vec v0, v1, v2, v3;
-    __builtin_memcpy(&v0, row0 + i, sizeof(Vec));
-    __builtin_memcpy(&v1, row1 + i, sizeof(Vec));
-    __builtin_memcpy(&v2, row2 + i, sizeof(Vec));
-    __builtin_memcpy(&v3, row3 + i, sizeof(Vec));
-    Vec sum = (v0 + v1) + (v2 + v3);
-    __builtin_memcpy(output + i, &sum, sizeof(Vec));
-  }
-}
-
-void reduce4SmallFloatRowsAvx512(char const* inputBase, size_t inputStride,
-                                 size_t count, float* output) {
-  size_t nVec = count / 16;
-  reduce4SmallFloatRowsAvx512Range(inputBase, inputStride, output, 0, nVec);
-  auto const* row0 = reinterpret_cast<float const*>(inputBase);
-  auto const* row1 =
-      reinterpret_cast<float const*>(inputBase + inputStride);
-  auto const* row2 =
-      reinterpret_cast<float const*>(inputBase + 2 * inputStride);
-  auto const* row3 =
-      reinterpret_cast<float const*>(inputBase + 3 * inputStride);
-  for (size_t i = nVec * 16; i < count; ++i) {
-    output[i] = row0[i] + row1[i] + row2[i] + row3[i];
-  }
-}
-
-__attribute__((target("avx512f")))
-void addSmallFloatAvx512Range(float const* a, float const* b, float* output,
-                              size_t vecBegin, size_t vecEnd) {
-  using Vec = float __attribute__((vector_size(64)));
-  for (size_t vec = vecBegin; vec < vecEnd; ++vec) {
-    size_t i = vec * 16;
-    Vec va, vb;
-    __builtin_memcpy(&va, a + i, sizeof(Vec));
-    __builtin_memcpy(&vb, b + i, sizeof(Vec));
-    Vec sum = va + vb;
-    __builtin_memcpy(output + i, &sum, sizeof(Vec));
-  }
-}
-
-void addSmallFloatAvx512(float const* a, float const* b, float* output,
-                         size_t count) {
-  size_t nVec = count / 16;
-  addSmallFloatAvx512Range(a, b, output, 0, nVec);
-  for (size_t i = nVec * 16; i < count; ++i) output[i] = a[i] + b[i];
-}
-
-__attribute__((target("avx512f")))
-void reduce2SmallFloatRowsAvx512(char const* inputBase, size_t inputStride,
-                                 size_t count, float* output) {
-  auto const* row0 = reinterpret_cast<float const*>(inputBase);
-  auto const* row1 =
-      reinterpret_cast<float const*>(inputBase + inputStride);
-  addSmallFloatAvx512(row0, row1, output, count);
-}
-
+/*
+The AllReduce host slabs contain one input row per local rank.
+A one-rank input is a host copy; otherwise the same element from every rank is summed.
+*/
 void reduceSmallLocalRows(char const* inputBase, size_t inputStride, int nRows,
                           size_t count, float* output) {
+  mscclpp::lite::CpuSwitch<float> cpuSwitch;
   if (nRows == 1) {
-    std::memcpy(output, inputBase, count * sizeof(float));
-  } else if (nRows == 2) {
-    reduce2SmallFloatRowsAvx512(inputBase, inputStride, count, output);
-  } else if (nRows == 4) {
-    reduce4SmallFloatRowsAvx512(inputBase, inputStride, count, output);
+    cpuSwitch.copy<mscclpp::lite::MemoryType::HostPinned,
+                   mscclpp::lite::MemoryType::HostPinned, float const>(
+        {reinterpret_cast<float const*>(inputBase), count}, {output, count});
+    return;
   }
+  std::vector<mscclpp::lite::Span<float const>> inputs;
+  inputs.reserve(nRows);
+  for (int row = 0; row < nRows; ++row) {
+    inputs.push_back(
+        {reinterpret_cast<float const*>(
+             inputBase + static_cast<size_t>(row) * inputStride), count});
+  }
+  cpuSwitch.reduce(inputs, {output, count});
 }
 
 bool isAlignedForInt4(void const* ptr) {
@@ -1681,6 +1594,7 @@ ncclResult_t runHostStagedReduceScatter2Node(
     mscclpp::CudaDeviceGuard deviceGuard(cudaDevice);
     auto& ctx = getReduceScatterHostContext(
         comm, bootstrapComm, rank, nRanks, nRanksPerNode, cudaDevice);
+    mscclpp::lite::CpuSwitch<float, mscclpp::lite::Sum<float>> cpuSwitch;
     uint64_t epoch = ++ctx.blockEpoch;
     int localBase = ctx.nodeId * nRanksPerNode;
     int remoteBase = (1 - ctx.nodeId) * nRanksPerNode;
@@ -1689,14 +1603,19 @@ ncclResult_t runHostStagedReduceScatter2Node(
 
     char* localInput =
         ctx.sendSlab() + static_cast<size_t>(ctx.localRank) * ctx.inputCapacity;
-    MSCCLPP_CUDATHROW(cudaMemcpyAsync(localInput, sendbuff, inputBytes,
-                                     cudaMemcpyDeviceToHost, stream));
-    MSCCLPP_CUDATHROW(cudaStreamSynchronize(stream));
-    ctx.ctrl->d2hReady[ctx.localRank].store(epoch,
-                                            std::memory_order_release);
+    cpuSwitch
+        .copy<mscclpp::lite::MemoryType::Device,
+              mscclpp::lite::MemoryType::HostMapped, float const>(
+            {static_cast<float const*>(sendbuff), inputBytes / sizeof(float),
+             -1, cudaDevice},
+            {reinterpret_cast<float*>(localInput), inputBytes / sizeof(float),
+             -1, -1},
+            stream)
+        .wait();
+    cpuSwitch.publishEpoch(ctx.ctrl->d2hReady[ctx.localRank], epoch);
 
     for (int i = 0; i < nRanksPerNode; ++i) {
-      waitForEpoch(ctx.ctrl->d2hReady[i], epoch);
+      cpuSwitch.waitEpoch(ctx.ctrl->d2hReady[i], epoch);
     }
 
     auto* localPartial = reinterpret_cast<float*>(
@@ -1705,26 +1624,33 @@ ncclResult_t runHostStagedReduceScatter2Node(
     auto* remotePartial = reinterpret_cast<float*>(
         ctx.sendPartialSlab() +
         static_cast<size_t>(ctx.localRank) * bytesPerRank);
-    reduceFloatShardFromHost(ctx.sendSlab(), ctx.inputCapacity, bytesPerRank,
-                             nRanksPerNode, localBase + ctx.localRank,
-                             recvcount, localPartial);
-    reduceFloatShardFromHost(ctx.sendSlab(), ctx.inputCapacity, bytesPerRank,
-                             nRanksPerNode, remoteBase + ctx.localRank,
-                             recvcount, remotePartial);
-    ctx.ctrl->partialReady[ctx.localRank].store(epoch,
-                                                std::memory_order_release);
+    std::vector<mscclpp::lite::Rows<float const>> localRankRows;
+    localRankRows.reserve(nRanksPerNode);
+    for (int local = 0; local < nRanksPerNode; ++local) {
+      localRankRows.push_back({
+          reinterpret_cast<float const*>(
+              ctx.sendSlab() + static_cast<size_t>(local) * ctx.inputCapacity),
+          static_cast<size_t>(nRanks), recvcount,
+          bytesPerRank / sizeof(float), -1, -1});
+    }
+    cpuSwitch.reduceTwoRows(
+        localRankRows, static_cast<size_t>(localBase + ctx.localRank),
+        {localPartial, recvcount, -1, -1},
+        static_cast<size_t>(remoteBase + ctx.localRank),
+        {remotePartial, recvcount, -1, -1});
+    cpuSwitch.publishEpoch(ctx.ctrl->partialReady[ctx.localRank], epoch);
 
     if (ctx.isLeader) {
       for (int i = 0; i < nRanksPerNode; ++i) {
-        waitForEpoch(ctx.ctrl->partialReady[i], epoch);
+        cpuSwitch.waitEpoch(ctx.ctrl->partialReady[i], epoch);
       }
       if (ctx.pairEpoch > 0) {
         for (int i = 0; i < nRanksPerNode; ++i) {
-          waitForEpoch(ctx.ctrl->pairAckReady[i], ctx.pairEpoch);
+          cpuSwitch.waitEpoch(ctx.ctrl->pairAckReady[i], ctx.pairEpoch);
         }
       }
       if (epoch > 1) {
-        waitForEpoch(ctx.ctrl->ackReady, epoch - 1);
+        cpuSwitch.waitEpoch(ctx.ctrl->ackReady, epoch - 1);
       }
 
       size_t off = 0;
@@ -1733,47 +1659,51 @@ ncclResult_t runHostStagedReduceScatter2Node(
         size_t chunk =
             std::min(kNativeReduceScatterRdmaChunkBytes,
                      partialBlockBytes - off);
-        ctx.connection.write(ctx.remoteRecvPartialMemory, off,
-                             ctx.sendPartialMemory, off, chunk);
+        cpuSwitch.rdmaWrite(ctx.connection, ctx.remoteRecvPartialMemory, off,
+                            ctx.sendPartialMemory, off, chunk);
         if (++writesSinceFlush == kNativeReduceScatterSignalEveryN) {
-          ctx.connection.flush();
+          cpuSwitch.rdmaFlush(ctx.connection);
           writesSinceFlush = 0;
         }
         off += chunk;
       }
-      ctx.ctrl->rdmaSignal.store(epoch, std::memory_order_release);
-      ctx.connection.write(
-          ctx.remoteCtrlMemory,
-          offsetof(NativeReduceScatterHostControl, rdmaReady), ctx.ctrlMemory,
-          offsetof(NativeReduceScatterHostControl, rdmaSignal),
+      cpuSwitch.publishEpoch(ctx.ctrl->rdmaSignal, epoch);
+      cpuSwitch.rdmaWriteAndFlush(
+          ctx.connection, 
+          ctx.remoteCtrlMemory, 
+          offsetof(NativeReduceScatterHostControl, rdmaReady), 
+          ctx.ctrlMemory, 
+          offsetof(NativeReduceScatterHostControl, rdmaSignal), 
           sizeof(uint64_t));
-      ctx.connection.flush();
     }
-    waitForEpoch(ctx.ctrl->rdmaReady, epoch);
+    cpuSwitch.waitEpoch(ctx.ctrl->rdmaReady, epoch);
 
     auto* remoteIncoming = reinterpret_cast<float*>(
         ctx.recvPartialSlab() +
         static_cast<size_t>(ctx.localRank) * bytesPerRank);
-    for (size_t i = 0; i < recvcount; ++i) {
-      localPartial[i] += remoteIncoming[i];
-    }
+    cpuSwitch.reduceInPlace({localPartial, recvcount, -1, -1},
+                            {remoteIncoming, recvcount, -1, -1});
 
-    MSCCLPP_CUDATHROW(cudaMemcpyAsync(recvbuff, localPartial, bytesPerRank,
-                                     cudaMemcpyHostToDevice, stream));
-    MSCCLPP_CUDATHROW(cudaStreamSynchronize(stream));
-    ctx.ctrl->h2dDone[ctx.localRank].store(epoch, std::memory_order_release);
+    cpuSwitch
+        .copy<mscclpp::lite::MemoryType::HostMapped,
+              mscclpp::lite::MemoryType::Device, float const>(
+            {localPartial, recvcount, -1, -1},
+            {static_cast<float*>(recvbuff), recvcount, -1, cudaDevice}, stream)
+        .wait();
+    cpuSwitch.publishEpoch(ctx.ctrl->h2dDone[ctx.localRank], epoch);
 
     for (int i = 0; i < nRanksPerNode; ++i) {
-      waitForEpoch(ctx.ctrl->h2dDone[i], epoch);
+      cpuSwitch.waitEpoch(ctx.ctrl->h2dDone[i], epoch);
     }
     if (ctx.isLeader) {
-      ctx.ctrl->ackSignal.store(epoch, std::memory_order_release);
-      ctx.connection.write(
-          ctx.remoteCtrlMemory,
-          offsetof(NativeReduceScatterHostControl, ackReady), ctx.ctrlMemory,
-          offsetof(NativeReduceScatterHostControl, ackSignal),
+      cpuSwitch.publishEpoch(ctx.ctrl->ackSignal, epoch);
+      cpuSwitch.rdmaWriteAndFlush(
+          ctx.connection, 
+          ctx.remoteCtrlMemory, 
+          offsetof(NativeReduceScatterHostControl, ackReady), 
+          ctx.ctrlMemory, 
+          offsetof(NativeReduceScatterHostControl, ackSignal), 
           sizeof(uint64_t));
-      ctx.connection.flush();
     }
     return ncclSuccess;
   } catch (std::exception const& ex) {
@@ -2402,19 +2332,21 @@ ncclResult_t runSmallMappedAllReduce2Node(
         offsetof(NativeReduceScatterHostControl, smallRdmaReady);
     size_t smallRdmaSignalOffset =
         offsetof(NativeReduceScatterHostControl, smallRdmaSignal);
-    ctx.pairConnection.write(ctx.pairRemoteRecvPartialMemory, partialOffset,
-                             ctx.sendPartialMemory, partialOffset, bytes);
+    mscclpp::lite::CpuSwitch<char> rdmaSwitch;
+    rdmaSwitch.rdmaWrite(ctx.pairConnection, ctx.pairRemoteRecvPartialMemory,
+                         partialOffset, ctx.sendPartialMemory, partialOffset,
+                         bytes);
     ctx.ctrl->smallRdmaSignal.store(epoch, std::memory_order_release);
-    ctx.pairConnection.write(ctx.pairRemoteCtrlMemory, smallRdmaReadyOffset,
-                             ctx.ctrlMemory, smallRdmaSignalOffset,
-                             sizeof(uint64_t));
-    ctx.pairConnection.flush();
+    rdmaSwitch.rdmaWriteAndFlush(
+        ctx.pairConnection, ctx.pairRemoteCtrlMemory, smallRdmaReadyOffset,
+        ctx.ctrlMemory, smallRdmaSignalOffset, sizeof(uint64_t));
     waitForEpoch(ctx.ctrl->smallRdmaReady, epoch);
 
     auto* local = reinterpret_cast<float*>(localPartial);
     auto const* remote = reinterpret_cast<float const*>(remotePartial);
     auto* out = reinterpret_cast<float*>(final);
-    addSmallFloatAvx512(local, remote, out, count);
+    mscclpp::lite::CpuSwitch<float>{}.reduce(
+        {{local, count}, {remote, count}}, {out, count});
     ctx.ctrl->smallFinalReady.store(epoch, std::memory_order_release);
     return ncclSuccess;
   } catch (std::exception const& ex) {
@@ -2455,8 +2387,11 @@ ncclResult_t runSmallTwoLeaderAllReduce2Node(
     size_t halfCount = count / 2;
     size_t halfBytes = bytes / 2;
 
-    MSCCLPP_CUDATHROW(cudaMemcpyAsync(ctx.sendSlab() + inputOffset, sendbuff,
-                                      bytes, cudaMemcpyDeviceToHost, stream));
+    mscclpp::lite::CpuSwitch<char>{}
+        .enqueueCopy<mscclpp::lite::MemoryType::Device,
+                     mscclpp::lite::MemoryType::HostPinned, char const>(
+            {static_cast<char const*>(sendbuff), bytes},
+            {ctx.sendSlab() + inputOffset, bytes}, stream);
     MSCCLPP_CUDATHROW(cudaStreamSynchronize(stream));
     ctx.ctrl->smallInputReady[localRank].store(epoch,
                                                std::memory_order_release);
@@ -2474,9 +2409,12 @@ ncclResult_t runSmallTwoLeaderAllReduce2Node(
       for (int i = 0; i < nRanksPerNode; ++i) {
         waitForEpoch(ctx.ctrl->smallInputReady[i], epoch);
       }
-      reduce4SmallFloatRowsAvx512(ctx.sendSlab() + byteOffset, inputStride,
-                                  halfCount,
-                                  reinterpret_cast<float*>(localPartial));
+      reduceSmallLocalRows(
+          ctx.sendSlab() + byteOffset, 
+          inputStride, 
+          nRanksPerNode, 
+          halfCount, 
+          reinterpret_cast<float*>(localPartial));
 
       size_t rdmaReadyOffset =
           offsetof(NativeReduceScatterHostControl, smallPairRdmaReady) +
@@ -2486,31 +2424,44 @@ ncclResult_t runSmallTwoLeaderAllReduce2Node(
           offsetof(NativeReduceScatterHostControl, smallPairRdmaSignal) +
           static_cast<size_t>(localRank) *
               sizeof(ctx.ctrl->smallPairRdmaSignal[0]);
-      ctx.pairConnection.write(ctx.pairRemoteRecvPartialMemory, partialOffset,
-                               ctx.sendPartialMemory, partialOffset, halfBytes);
-      ctx.ctrl->smallPairRdmaSignal[localRank].store(
-          epoch, std::memory_order_release);
-      ctx.pairConnection.write(ctx.pairRemoteCtrlMemory, rdmaReadyOffset,
-                               ctx.ctrlMemory, rdmaSignalOffset,
-                               sizeof(uint64_t));
-      ctx.pairConnection.flush();
+      mscclpp::lite::CpuSwitch<char> rdmaSwitch;
+      rdmaSwitch.rdmaWrite(
+          ctx.pairConnection, 
+          ctx.pairRemoteRecvPartialMemory, 
+          partialOffset, 
+          ctx.sendPartialMemory, 
+          partialOffset, 
+          halfBytes);
+      ctx.ctrl->smallPairRdmaSignal[localRank].store(epoch, std::memory_order_release);
+      rdmaSwitch.rdmaWriteAndFlush(
+          ctx.pairConnection, 
+          ctx.pairRemoteCtrlMemory, 
+          rdmaReadyOffset,
+          ctx.ctrlMemory, 
+          rdmaSignalOffset, 
+          sizeof(uint64_t));
       waitForEpoch(ctx.ctrl->smallPairRdmaReady[localRank], epoch);
-      addSmallFloatAvx512(reinterpret_cast<float*>(localPartial),
-                          reinterpret_cast<float const*>(remotePartial),
-                          reinterpret_cast<float*>(final), halfCount);
-      ctx.ctrl->smallPartReady[localRank].store(epoch,
-                                                std::memory_order_release);
+      mscclpp::lite::CpuSwitch<float>{}.reduce(
+          {{reinterpret_cast<float const*>(localPartial), halfCount},
+           {reinterpret_cast<float const*>(remotePartial), halfCount}},
+          {reinterpret_cast<float*>(final), halfCount});
+      ctx.ctrl->smallPartReady[localRank].store(epoch, std::memory_order_release);
     }
 
     waitForEpoch(ctx.ctrl->smallPartReady[0], epoch);
     waitForEpoch(ctx.ctrl->smallPartReady[2], epoch);
-    MSCCLPP_CUDATHROW(cudaMemcpyAsync(
-        recvbuff, ctx.localPartialSlab() + ctx.partialSlotOffset(epoch, 0),
-        halfBytes, cudaMemcpyHostToDevice, stream));
-    MSCCLPP_CUDATHROW(cudaMemcpyAsync(
-        static_cast<char*>(recvbuff) + halfBytes,
-        ctx.localPartialSlab() + ctx.partialSlotOffset(epoch, 2), halfBytes,
-        cudaMemcpyHostToDevice, stream));
+    mscclpp::lite::CpuSwitch<char>{}
+        .enqueueCopy<mscclpp::lite::MemoryType::HostPinned,
+                     mscclpp::lite::MemoryType::Device, char const>(
+            {ctx.localPartialSlab() + ctx.partialSlotOffset(epoch, 0), halfBytes},
+            {static_cast<char*>(recvbuff), halfBytes}, 
+            stream);
+    mscclpp::lite::CpuSwitch<char>{}
+        .enqueueCopy<mscclpp::lite::MemoryType::HostPinned,
+                     mscclpp::lite::MemoryType::Device, char const>(
+            {ctx.localPartialSlab() + ctx.partialSlotOffset(epoch, 2), halfBytes},
+            {static_cast<char*>(recvbuff) + halfBytes, halfBytes}, 
+            stream);
     return ncclSuccess;
   } catch (std::exception const& ex) {
     WARN("small two-leader allreduce failed: %s", ex.what());
@@ -2730,9 +2681,12 @@ ncclResult_t runTwoRankRingSimpleAllReduce2Node(
 
             size_t sendStageOffset = stageOffset(0);
             if (peerCount > 0) {
-              MSCCLPP_CUDATHROW(cudaMemcpyAsync(
-                  ctx.sendPartialSlab() + sendStageOffset, send + peerOffset,
-                  peerCount * typeSize, cudaMemcpyDeviceToHost, localStream));
+              mscclpp::lite::CpuSwitch<char>{}
+                  .enqueueCopy<mscclpp::lite::MemoryType::Device,
+                               mscclpp::lite::MemoryType::HostPinned, char const>(
+                      {send + peerOffset, peerCount * typeSize},
+                      {ctx.sendPartialSlab() + sendStageOffset, peerCount * typeSize},
+                      localStream);
               MSCCLPP_CUDATHROW(cudaStreamSynchronize(localStream));
             }
             ctx.ctrl->twoRankRingSignal[channel][0].store(
@@ -2745,9 +2699,12 @@ ncclResult_t runTwoRankRingSimpleAllReduce2Node(
 
             waitForEpoch(ctx.ctrl->twoRankRingReady[channel][0], sendEpoch);
             if (ownCount > 0) {
-              MSCCLPP_CUDATHROW(cudaMemcpyAsync(
-                  remoteGpu, ctx.recvPartialSlab() + sendStageOffset,
-                  ownCount * typeSize, cudaMemcpyHostToDevice, localStream));
+              mscclpp::lite::CpuSwitch<char>{}
+                  .enqueueCopy<mscclpp::lite::MemoryType::HostPinned,
+                               mscclpp::lite::MemoryType::Device, char const>(
+                      {ctx.recvPartialSlab() + sendStageOffset, ownCount * typeSize}, 
+                      {remoteGpu, ownCount * typeSize}, 
+                      localStream);
               ch.result = launchAddFloat(
                   send + ownOffset, remoteGpu, recv + ownOffset, ownCount,
                   localStream);
@@ -2757,9 +2714,12 @@ ncclResult_t runTwoRankRingSimpleAllReduce2Node(
 
             size_t finalStageOffset = stageOffset(1);
             if (ownCount > 0) {
-              MSCCLPP_CUDATHROW(cudaMemcpyAsync(
-                  ctx.sendPartialSlab() + finalStageOffset, recv + ownOffset,
-                  ownCount * typeSize, cudaMemcpyDeviceToHost, localStream));
+              mscclpp::lite::CpuSwitch<char>{}
+                  .enqueueCopy<mscclpp::lite::MemoryType::Device,
+                               mscclpp::lite::MemoryType::HostPinned, char const>(
+                      {recv + ownOffset, ownCount * typeSize},
+                      {ctx.sendPartialSlab() + finalStageOffset, ownCount * typeSize},
+                      localStream);
               MSCCLPP_CUDATHROW(cudaStreamSynchronize(localStream));
             }
             ctx.ctrl->twoRankRingSignal[channel][1].store(
@@ -2772,9 +2732,12 @@ ncclResult_t runTwoRankRingSimpleAllReduce2Node(
 
             waitForEpoch(ctx.ctrl->twoRankRingReady[channel][1], finalEpoch);
             if (peerCount > 0) {
-              MSCCLPP_CUDATHROW(cudaMemcpyAsync(
-                  recv + peerOffset, ctx.recvPartialSlab() + finalStageOffset,
-                  peerCount * typeSize, cudaMemcpyHostToDevice, localStream));
+              mscclpp::lite::CpuSwitch<char>{}
+                  .enqueueCopy<mscclpp::lite::MemoryType::HostPinned,
+                               mscclpp::lite::MemoryType::Device, char const>(
+                      {ctx.recvPartialSlab() + finalStageOffset, peerCount * typeSize},
+                      {recv + peerOffset, peerCount * typeSize}, 
+                      localStream);
               MSCCLPP_CUDATHROW(cudaStreamSynchronize(localStream));
             }
           }
