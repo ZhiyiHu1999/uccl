@@ -4,11 +4,13 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
+#include <dlfcn.h>
 
 #define CUDA_CHECK(call)                                                        \
   do {                                                                          \
@@ -31,6 +33,64 @@
   } while (0)
 
 enum class BenchCollective { AllGather, AllReduce, ReduceScatter };
+
+struct ExternalNcclApi {
+  void* library = nullptr;
+  decltype(&ncclGetUniqueId) getUniqueId = nullptr;
+  decltype(&ncclCommInitRank) commInitRank = nullptr;
+  decltype(&ncclCommDestroy) commDestroy = nullptr;
+  decltype(&ncclAllGather) allGather = nullptr;
+  decltype(&ncclAllReduce) allReduce = nullptr;
+  decltype(&ncclReduceScatter) reduceScatter = nullptr;
+  decltype(&ncclGetErrorString) getErrorString = nullptr;
+
+  template <typename T>
+  T symbol(const char* name) {
+    void* value = dlsym(library, name);
+    if (value == nullptr) {
+      std::fprintf(stderr, "missing NCCL symbol %s: %s\n", name, dlerror());
+      MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    return reinterpret_cast<T>(value);
+  }
+
+  explicit ExternalNcclApi(const char* path) {
+    int flags = RTLD_NOW | RTLD_LOCAL;
+#if defined(RTLD_DEEPBIND)
+    flags |= RTLD_DEEPBIND;
+#endif
+    library = dlopen(path, flags);
+    if (library == nullptr) {
+      std::fprintf(stderr, "failed to load NCCL baseline %s: %s\n", path,
+                   dlerror());
+      MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    getUniqueId = symbol<decltype(getUniqueId)>("ncclGetUniqueId");
+    commInitRank = symbol<decltype(commInitRank)>("ncclCommInitRank");
+    commDestroy = symbol<decltype(commDestroy)>("ncclCommDestroy");
+    allGather = symbol<decltype(allGather)>("ncclAllGather");
+    allReduce = symbol<decltype(allReduce)>("ncclAllReduce");
+    reduceScatter = symbol<decltype(reduceScatter)>("ncclReduceScatter");
+    getErrorString = symbol<decltype(getErrorString)>("ncclGetErrorString");
+  }
+
+  ~ExternalNcclApi() {
+    if (library != nullptr) dlclose(library);
+  }
+
+  void check(ncclResult_t result, const char* operation) const {
+    if (result == ncclSuccess) return;
+    std::fprintf(stderr, "NCCL baseline %s failed: %s\n", operation,
+                 getErrorString(result));
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
+};
+
+struct Sample {
+  float deviceUs;
+  float endToEndUs;
+};
+static_assert(sizeof(Sample) == 2 * sizeof(float));
 
 __global__ void initializeFloats(float* data, size_t count, int rank) {
   size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -86,10 +146,12 @@ static float percentile(std::vector<float> values, double fraction) {
   return values[index];
 }
 
-static float launchOnce(BenchCollective collective,
-                        mscclppDeviceAllGatherHandle_t handle,
-                        const float* input, float* output, size_t count,
-                        int* status, cudaEvent_t start, cudaEvent_t stop) {
+static Sample launchGpuDrivenOnce(BenchCollective collective,
+                                  mscclppDeviceAllGatherHandle_t handle,
+                                  const float* input, float* output,
+                                  size_t count, int* status,
+                                  cudaEvent_t start, cudaEvent_t stop) {
+  auto wallStart = std::chrono::steady_clock::now();
   CUDA_CHECK(cudaEventRecord(start));
   switch (collective) {
     case BenchCollective::AllGather:
@@ -108,12 +170,57 @@ static float launchOnce(BenchCollective collective,
   CUDA_CHECK(cudaEventSynchronize(stop));
   float milliseconds = 0.0f;
   CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
-  return milliseconds * 1000.0f;
+  auto wallStop = std::chrono::steady_clock::now();
+  float endToEndUs = std::chrono::duration<float, std::micro>(
+                         wallStop - wallStart)
+                         .count();
+  return {milliseconds * 1000.0f, endToEndUs};
 }
 
-static void runBenchmark(BenchCollective collective, size_t bytes,
-                         int warmups, int iterations, int rank, int nranks,
-                         mscclppDeviceAllGatherHandle_t handle) {
+static Sample launchNcclOnce(BenchCollective collective,
+                             const ExternalNcclApi& api, ncclComm_t comm,
+                             const float* input, float* output, size_t count,
+                             cudaStream_t stream, cudaEvent_t start,
+                             cudaEvent_t stop) {
+  auto wallStart = std::chrono::steady_clock::now();
+  CUDA_CHECK(cudaEventRecord(start, stream));
+  ncclResult_t result = ncclSuccess;
+  switch (collective) {
+    case BenchCollective::AllGather:
+      result = api.allGather(input, output, count, ncclFloat32, comm, stream);
+      break;
+    case BenchCollective::AllReduce:
+      result = api.allReduce(input, output, count, ncclFloat32, ncclSum, comm,
+                             stream);
+      break;
+    case BenchCollective::ReduceScatter:
+      result = api.reduceScatter(input, output, count, ncclFloat32, ncclSum,
+                                 comm, stream);
+      break;
+  }
+  api.check(result, collectiveName(collective));
+  CUDA_CHECK(cudaEventRecord(stop, stream));
+  CUDA_CHECK(cudaEventSynchronize(stop));
+  float milliseconds = 0.0f;
+  CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
+  auto wallStop = std::chrono::steady_clock::now();
+  float endToEndUs = std::chrono::duration<float, std::micro>(
+                         wallStop - wallStart)
+                         .count();
+  return {milliseconds * 1000.0f, endToEndUs};
+}
+
+static float mean(const std::vector<float>& values) {
+  double sum = 0.0;
+  for (float value : values) sum += value;
+  return static_cast<float>(sum / values.size());
+}
+
+static void runComparison(BenchCollective collective, size_t bytes,
+                          int warmups, int iterations, int rank, int nranks,
+                          mscclppDeviceAllGatherHandle_t handle,
+                          const ExternalNcclApi& ncclApi,
+                          ncclComm_t ncclComm, cudaStream_t ncclStream) {
   if (bytes % sizeof(float) != 0) {
     if (rank == 0) std::fprintf(stderr, "size must be divisible by 4\n");
     MPI_Abort(MPI_COMM_WORLD, 1);
@@ -144,20 +251,44 @@ static void runBenchmark(BenchCollective collective, size_t bytes,
 
   MPI_Barrier(MPI_COMM_WORLD);
   for (int i = 0; i < warmups; ++i) {
-    (void)launchOnce(collective, handle, input, output, count, status, start,
-                     stop);
+    (void)launchGpuDrivenOnce(collective, handle, input, output, count, status,
+                              start, stop);
+  }
+  MPI_Barrier(MPI_COMM_WORLD);
+  for (int i = 0; i < warmups; ++i) {
+    (void)launchNcclOnce(collective, ncclApi, ncclComm, input, output, count,
+                         ncclStream, start, stop);
   }
 
-  std::vector<float> maximumRankTimes;
-  if (rank == 0) maximumRankTimes.reserve(iterations);
+  std::vector<float> gpuDeviceTimes, gpuEndToEndTimes;
+  std::vector<float> ncclDeviceTimes, ncclEndToEndTimes;
+  if (rank == 0) {
+    gpuDeviceTimes.reserve(iterations);
+    gpuEndToEndTimes.reserve(iterations);
+    ncclDeviceTimes.reserve(iterations);
+    ncclEndToEndTimes.reserve(iterations);
+  }
   for (int i = 0; i < iterations; ++i) {
     MPI_Barrier(MPI_COMM_WORLD);
-    float localUs = launchOnce(collective, handle, input, output, count, status,
-                               start, stop);
-    float maximumUs = 0.0f;
-    MPI_Reduce(&localUs, &maximumUs, 1, MPI_FLOAT, MPI_MAX, 0,
-               MPI_COMM_WORLD);
-    if (rank == 0) maximumRankTimes.push_back(maximumUs);
+    Sample local = launchGpuDrivenOnce(collective, handle, input, output,
+                                       count, status, start, stop);
+    Sample maximum{};
+    MPI_Reduce(&local, &maximum, 2, MPI_FLOAT, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (rank == 0) {
+      gpuDeviceTimes.push_back(maximum.deviceUs);
+      gpuEndToEndTimes.push_back(maximum.endToEndUs);
+    }
+  }
+  for (int i = 0; i < iterations; ++i) {
+    MPI_Barrier(MPI_COMM_WORLD);
+    Sample local = launchNcclOnce(collective, ncclApi, ncclComm, input, output,
+                                  count, ncclStream, start, stop);
+    Sample maximum{};
+    MPI_Reduce(&local, &maximum, 2, MPI_FLOAT, MPI_MAX, 0, MPI_COMM_WORLD);
+    if (rank == 0) {
+      ncclDeviceTimes.push_back(maximum.deviceUs);
+      ncclEndToEndTimes.push_back(maximum.endToEndUs);
+    }
   }
 
   int deviceStatus = 0;
@@ -174,16 +305,18 @@ static void runBenchmark(BenchCollective collective, size_t bytes,
   }
 
   if (rank == 0) {
-    double sum = 0.0;
-    for (float value : maximumRankTimes) sum += value;
-    std::printf("%-14s bytes_per_rank=%-8zu kernel_us avg=%8.3f "
-                "p50=%8.3f p95=%8.3f min=%8.3f\n",
-                collectiveName(collective), bytes,
-                sum / maximumRankTimes.size(),
-                percentile(maximumRankTimes, 0.50),
-                percentile(maximumRankTimes, 0.95),
-                *std::min_element(maximumRankTimes.begin(),
-                                  maximumRankTimes.end()));
+    float gpuE2e = mean(gpuEndToEndTimes);
+    float ncclE2e = mean(ncclEndToEndTimes);
+    std::printf(
+        "%-14s bytes_per_rank=%-8zu "
+        "gpu_device_us=%8.3f gpu_e2e_us=%8.3f gpu_p50_us=%8.3f "
+        "gpu_p95_us=%8.3f nccl_device_us=%8.3f nccl_e2e_us=%8.3f "
+        "nccl_p50_us=%8.3f nccl_p95_us=%8.3f speedup_e2e=%6.3fx\n",
+        collectiveName(collective), bytes, mean(gpuDeviceTimes), gpuE2e,
+        percentile(gpuEndToEndTimes, 0.50),
+        percentile(gpuEndToEndTimes, 0.95), mean(ncclDeviceTimes), ncclE2e,
+        percentile(ncclEndToEndTimes, 0.50),
+        percentile(ncclEndToEndTimes, 0.95), ncclE2e / gpuE2e);
     std::fflush(stdout);
   }
 
@@ -219,6 +352,12 @@ int main(int argc, char** argv) {
 
   int warmups = 20;
   int iterations = 100;
+  if (const char* value = std::getenv("WARMUP_ITERS")) {
+    warmups = std::max(0, std::atoi(value));
+  }
+  if (const char* value = std::getenv("ITERS")) {
+    iterations = std::max(1, std::atoi(value));
+  }
   std::vector<size_t> sizes{128, 256, 512, 1024, 4096, 16384, 65536};
   if (argc > 1) {
     sizes.clear();
@@ -261,27 +400,47 @@ int main(int argc, char** argv) {
   NCCL_CHECK(mscclppGetDeviceCollectiveHandle(
       comm, maxStagedBytes, backend, &handle));
 
+  const char* ncclBaselinePath = std::getenv("NCCL_BASELINE_LIB");
+  if (ncclBaselinePath == nullptr || ncclBaselinePath[0] == '\0') {
+    if (rank == 0) {
+      std::fprintf(stderr,
+                   "NCCL_BASELINE_LIB must point to the real libnccl.so\n");
+    }
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
+  ExternalNcclApi ncclApi(ncclBaselinePath);
+  ncclUniqueId ncclId{};
+  if (rank == 0) ncclApi.check(ncclApi.getUniqueId(&ncclId), "get unique ID");
+  MPI_Bcast(&ncclId, sizeof(ncclId), MPI_BYTE, 0, MPI_COMM_WORLD);
+  ncclComm_t ncclComm = nullptr;
+  ncclApi.check(ncclApi.commInitRank(&ncclComm, nranks, ncclId, rank),
+                "communicator initialization");
+  cudaStream_t ncclStream = nullptr;
+  CUDA_CHECK(cudaStreamCreateWithFlags(&ncclStream, cudaStreamNonBlocking));
+
   if (rank == 0) {
     std::printf(
-        "GPU-driven device collective kernel latency, backend=%s, ranks=%d, "
-        "warmups=%d, iterations=%d\n",
+        "GPU-driven vs NCCL collective latency, backend=%s, ranks=%d, "
+        "warmups=%d, iterations=%d, nccl=%s\n",
         handle.backend == mscclppDeviceCollectiveCudaIpc
             ? "cuda_ipc"
             : (handle.backend == mscclppDeviceCollectiveHostRdma
                    ? "host_rdma"
                    : "host"),
-        nranks, warmups, iterations);
+        nranks, warmups, iterations, ncclBaselinePath);
   }
   for (size_t bytes : sizes) {
-    runBenchmark(BenchCollective::AllGather, bytes, warmups, iterations, rank,
-                 nranks, handle);
-    runBenchmark(BenchCollective::AllReduce, bytes, warmups, iterations, rank,
-                 nranks, handle);
-    runBenchmark(BenchCollective::ReduceScatter, bytes, warmups, iterations,
-                 rank, nranks, handle);
+    runComparison(BenchCollective::AllGather, bytes, warmups, iterations, rank,
+                  nranks, handle, ncclApi, ncclComm, ncclStream);
+    runComparison(BenchCollective::AllReduce, bytes, warmups, iterations, rank,
+                  nranks, handle, ncclApi, ncclComm, ncclStream);
+    runComparison(BenchCollective::ReduceScatter, bytes, warmups, iterations,
+                  rank, nranks, handle, ncclApi, ncclComm, ncclStream);
   }
 
   CUDA_CHECK(cudaDeviceSynchronize());
+  ncclApi.check(ncclApi.commDestroy(ncclComm), "communicator destroy");
+  CUDA_CHECK(cudaStreamDestroy(ncclStream));
   NCCL_CHECK(ncclCommDestroy(comm));
   MPI_Comm_free(&localComm);
   MPI_Finalize();
