@@ -64,7 +64,7 @@ export NCCL_BASELINE_LIB
 export WARMUP_ITERS ITERS
 export LD_LIBRARY_PATH="${PROJECT_DIR}/nccl/build:${PROJECT_DIR}/build:${CUDA_HOME:-/usr/local/cuda}/lib64:${MPI_HOME}/lib:${LD_LIBRARY_PATH:-}"
 
-MPI_ARGS=(-np "${NP}")
+MPI_ARGS=(-np "${NP}" --bind-to none)
 if [[ -n "${HOSTS}" ]]; then
   IFS=',' read -r -a HOST_ARRAY <<<"${HOSTS}"
   IFS=',' read -r -a GPU_ARRAY <<<"${CUDA_VISIBLE_DEVICES}"
@@ -80,6 +80,14 @@ if [[ -n "${HOSTS}" ]]; then
   done
   MPI_ARGS+=(-H "${HOST_SPEC}")
 fi
+
+for variable in \
+  NCCL_SOCKET_IFNAME NCCL_IB_HCA NCCL_NET_GDR_LEVEL NCCL_BUFFSIZE \
+  MSCCLPP_SOCKET_IFNAME MSCCLPP_HCA_DEVICES; do
+  if [[ -n "${!variable:-}" ]]; then
+    MPI_ARGS+=(-x "${variable}")
+  fi
+done
 
 exec "${MPI_HOME}/bin/mpirun" "${MPI_ARGS[@]}" \
   -x CUDA_VISIBLE_DEVICES \
