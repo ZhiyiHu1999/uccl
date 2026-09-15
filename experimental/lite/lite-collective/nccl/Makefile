@@ -104,7 +104,7 @@ $(OUT_DIR)/device_collectives_bench.o: $(GPU_DRIVEN_DIR)/device_collectives_benc
 	$(NVCC) $(CUFLAGS) $(NVCC_GENCODE) -ccbin $(MPI_CXX) $(INCLUDES) $(DEFINES) -c $< -o $@
 
 $(OUT_DIR)/device_collectives_bench: $(OUT_DIR)/device_collectives_bench.o $(LIB_NCCL_SO)
-	$(NVCC) -ccbin $(MPI_CXX) -o $@ $< $(LDFLAGS) \
+	$(NVCC) -ccbin $(MPI_CXX) -o $@ $< -L$(OUT_DIR) $(LDFLAGS) \
 		-Xlinker -rpath -Xlinker '$$ORIGIN' -lmscclpp_nccl $(NVCC_LDLIBS)
 
 device-collectives-bench: $(OUT_DIR)/device_collectives_bench
