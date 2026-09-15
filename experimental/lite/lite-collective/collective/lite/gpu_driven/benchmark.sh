@@ -12,18 +12,48 @@ HOSTS="${HOSTS:-}"
 WARMUP_ITERS="${WARMUP_ITERS:-20}"
 ITERS="${ITERS:-100}"
 
-if [[ -z "${NCCL_BASELINE_LIB:-}" ]]; then
-  if [[ ! -d "${EXTERNAL_NCCL_DIR}" ]]; then
-    echo "error: external NCCL directory not found: ${EXTERNAL_NCCL_DIR}" >&2
-    exit 1
+find_nccl_baseline_lib() {
+  if [[ -n "${NCCL_BASELINE_LIB:-}" ]]; then
+    [[ -f "${NCCL_BASELINE_LIB}" ]] || {
+      echo "error: NCCL_BASELINE_LIB does not exist: ${NCCL_BASELINE_LIB}" >&2
+      return 1
+    }
+    printf '%s\n' "${NCCL_BASELINE_LIB}"
+    return
   fi
-  NCCL_BASELINE_LIB="$(find "${EXTERNAL_NCCL_DIR}" -maxdepth 4 -type f \
-    \( -name 'libnccl.so' -o -name 'libnccl.so.*' \) | sort -V | tail -n 1)"
-fi
-if [[ -z "${NCCL_BASELINE_LIB}" || ! -f "${NCCL_BASELINE_LIB}" ]]; then
-  echo "error: set NCCL_BASELINE_LIB to the real NCCL shared library" >&2
-  exit 1
-fi
+
+  if [[ -n "${NCCL_LIB_PATH:-}" ]]; then
+    [[ -f "${NCCL_LIB_PATH}" ]] || {
+      echo "error: NCCL_LIB_PATH does not exist: ${NCCL_LIB_PATH}" >&2
+      return 1
+    }
+    printf '%s\n' "${NCCL_LIB_PATH}"
+    return
+  fi
+
+  local standard_path="${EXTERNAL_NCCL_DIR}/build/lib/libnccl.so"
+  if [[ -f "${standard_path}" ]]; then
+    printf '%s\n' "${standard_path}"
+    return
+  fi
+
+  if [[ -d "${EXTERNAL_NCCL_DIR}" ]]; then
+    local discovered
+    discovered="$(find "${EXTERNAL_NCCL_DIR}" -maxdepth 4 -type f \
+      \( -name 'libnccl.so' -o -name 'libnccl.so.*' \) | sort -V | tail -n 1)"
+    if [[ -n "${discovered}" ]]; then
+      printf '%s\n' "${discovered}"
+      return
+    fi
+  fi
+
+  echo "error: unable to find the real NCCL shared library" >&2
+  echo "set NCCL_BASELINE_LIB, NCCL_LIB_PATH, or EXTERNAL_NCCL_DIR" >&2
+  return 1
+}
+
+NCCL_BASELINE_LIB="$(find_nccl_baseline_lib)"
+echo "[gpu-driven-benchmark] NCCL baseline: ${NCCL_BASELINE_LIB}" >&2
 
 make -C "${PROJECT_DIR}/nccl" device-collectives-bench \
   MPI_HOME="${MPI_HOME}"
