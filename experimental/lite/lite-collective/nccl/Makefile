@@ -45,6 +45,8 @@ AUDIT_OBJ    := $(OUT_DIR)/audit_nccl.o
 LDFLAGS := -L$(BUILD_DIR) -L$(CUDA_HOME)/lib64
 LDLIBS  := -Wl,--no-as-needed -lmint_collective -lmint -lcudart -lcuda -libverbs -lnuma \
            -lpthread -ldl -lstdc++fs
+NVCC_LDLIBS := -Xlinker --no-as-needed -lmint_collective -lmint -lcudart -lcuda \
+               -libverbs -lnuma -lpthread -ldl -lstdc++fs
 
 .PHONY: all clean mint-deps device-allgather-compile-test device-collectives-bench
 
@@ -102,7 +104,8 @@ $(OUT_DIR)/device_collectives_bench.o: $(GPU_DRIVEN_DIR)/device_collectives_benc
 	$(NVCC) $(CUFLAGS) $(NVCC_GENCODE) -ccbin $(MPI_CXX) $(INCLUDES) $(DEFINES) -c $< -o $@
 
 $(OUT_DIR)/device_collectives_bench: $(OUT_DIR)/device_collectives_bench.o $(LIB_NCCL_SO)
-	$(NVCC) -ccbin $(MPI_CXX) -o $@ $< $(LDFLAGS) -Wl,-rpath,'$$ORIGIN' -lmscclpp_nccl $(LDLIBS)
+	$(NVCC) -ccbin $(MPI_CXX) -o $@ $< $(LDFLAGS) \
+		-Xlinker -rpath -Xlinker '$$ORIGIN' -lmscclpp_nccl $(NVCC_LDLIBS)
 
 device-collectives-bench: $(OUT_DIR)/device_collectives_bench
 
