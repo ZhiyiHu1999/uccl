@@ -100,6 +100,57 @@ __global__ void initializeFloats(float* data, size_t count, int rank) {
   }
 }
 
+__global__ void probeDeviceByte(volatile unsigned char* address) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    unsigned char value = *address;
+    *address = value;
+  }
+}
+
+static void probeHandleAddress(const char* name, void* address, int rank) {
+  cudaPointerAttributes attributes{};
+  cudaError_t attributeResult = cudaPointerGetAttributes(&attributes, address);
+  if (attributeResult != cudaSuccess) {
+    std::fprintf(stderr,
+                 "rank %d: %s=%p cudaPointerGetAttributes failed: %s\n",
+                 rank, name, address, cudaGetErrorString(attributeResult));
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
+#if CUDART_VERSION >= 10000
+  std::fprintf(stderr,
+               "rank %d: probing %s=%p type=%d device=%d devicePointer=%p "
+               "hostPointer=%p\n",
+               rank, name, address, static_cast<int>(attributes.type),
+               attributes.device, attributes.devicePointer,
+               attributes.hostPointer);
+#else
+  std::fprintf(stderr,
+               "rank %d: probing %s=%p memoryType=%d device=%d "
+               "devicePointer=%p hostPointer=%p\n",
+               rank, name, address, static_cast<int>(attributes.memoryType),
+               attributes.device, attributes.devicePointer,
+               attributes.hostPointer);
+#endif
+  std::fflush(stderr);
+  probeDeviceByte<<<1, 1>>>(static_cast<volatile unsigned char*>(address));
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+  std::fprintf(stderr, "rank %d: %s probe passed\n", rank, name);
+  std::fflush(stderr);
+}
+
+static void debugProbeHandle(const mscclppDeviceAllGatherHandle_t& handle,
+                             int rank) {
+  const char* enabled = std::getenv("UCCL_GPU_DRIVEN_DEBUG_PROBE");
+  if (enabled == nullptr || std::strcmp(enabled, "0") == 0) return;
+  probeHandleAddress("localEpoch", handle.localEpoch, rank);
+  if (handle.backend == mscclppDeviceCollectiveHostMemory) {
+    probeHandleAddress("hostSlab", handle.slab, rank);
+    probeHandleAddress("hostControl", handle.control, rank);
+  }
+  MPI_Barrier(MPI_COMM_WORLD);
+}
+
 __global__ void allGatherBenchKernel(mscclppDeviceAllGatherHandle_t handle,
                                      const float* input, float* output,
                                      size_t count, int* status) {
@@ -415,6 +466,7 @@ int main(int argc, char** argv) {
   ncclComm_t ncclComm = nullptr;
   ncclApi.check(ncclApi.commInitRank(&ncclComm, nranks, ncclId, rank),
                 "communicator initialization");
+  debugProbeHandle(handle, rank);
   cudaStream_t ncclStream = nullptr;
   CUDA_CHECK(cudaStreamCreateWithFlags(&ncclStream, cudaStreamNonBlocking));
 

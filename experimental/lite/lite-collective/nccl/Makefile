@@ -101,7 +101,7 @@ $(OUT_DIR)/gpu_driven/%.cu.o: $(GPU_DRIVEN_DIR)/%.cu $(GPU_DRIVEN_DIR)/gpu_colle
 	$(NVCC) $(CUFLAGS) $(NVCC_GENCODE) $(INCLUDES) $(DEFINES) -c $< -o $@
 
 $(OUT_DIR)/device_collectives_bench.o: $(GPU_DRIVEN_DIR)/device_collectives_bench.cu $(GPU_DRIVEN_DIR)/gpu_collectives.cuh | $(OUT_DIR)
-	$(NVCC) $(CUFLAGS) $(NVCC_GENCODE) -ccbin $(MPI_CXX) $(INCLUDES) $(DEFINES) -c $< -o $@
+	$(NVCC) $(CUFLAGS) -lineinfo $(NVCC_GENCODE) -ccbin $(MPI_CXX) $(INCLUDES) $(DEFINES) -c $< -o $@
 
 $(OUT_DIR)/device_collectives_bench: $(OUT_DIR)/device_collectives_bench.o $(LIB_NCCL_SO)
 	$(NVCC) -ccbin $(MPI_CXX) -o $@ $< -L$(OUT_DIR) $(LDFLAGS) \
