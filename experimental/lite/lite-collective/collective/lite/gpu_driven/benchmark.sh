@@ -11,6 +11,8 @@ UCCL_GPU_DRIVEN_BACKEND="${UCCL_GPU_DRIVEN_BACKEND:-host}"
 HOSTS="${HOSTS:-}"
 WARMUP_ITERS="${WARMUP_ITERS:-20}"
 ITERS="${ITERS:-100}"
+RESULT_DIR="${RESULT_DIR:-${PROJECT_DIR}/.tmp/gpu-driven-benchmarks}"
+RESULT_FILE="${RESULT_FILE:-${RESULT_DIR}/gpu-driven-${UCCL_GPU_DRIVEN_BACKEND}-${NP}ranks-$(date +%Y%m%d-%H%M%S).md}"
 
 find_nccl_baseline_lib() {
   if [[ -n "${NCCL_BASELINE_LIB:-}" ]]; then
@@ -89,11 +91,63 @@ for variable in \
   fi
 done
 
-exec "${MPI_HOME}/bin/mpirun" "${MPI_ARGS[@]}" \
+mkdir -p "$(dirname "${RESULT_FILE}")"
+RAW_OUTPUT="$(mktemp "${TMPDIR:-/tmp}/gpu-driven-benchmark.XXXXXX")"
+trap 'rm -f "${RAW_OUTPUT}"' EXIT
+
+"${MPI_HOME}/bin/mpirun" "${MPI_ARGS[@]}" \
   -x CUDA_VISIBLE_DEVICES \
   -x UCCL_GPU_DRIVEN_BACKEND \
   -x NCCL_BASELINE_LIB \
   -x WARMUP_ITERS \
   -x ITERS \
   -x LD_LIBRARY_PATH \
-  "${PROJECT_DIR}/nccl/build/device_collectives_bench" "$@"
+  "${PROJECT_DIR}/nccl/build/device_collectives_bench" "$@" \
+  2>&1 | tee "${RAW_OUTPUT}"
+
+{
+  printf '# GPU-driven lite collectives vs NCCL\n\n'
+  printf -- '- Backend: `%s`\n' "${UCCL_GPU_DRIVEN_BACKEND}"
+  printf -- '- Ranks: `%s`\n' "${NP}"
+  printf -- '- CUDA devices per node: `%s`\n' "${CUDA_VISIBLE_DEVICES}"
+  printf -- '- Warmup iterations: `%s`\n' "${WARMUP_ITERS}"
+  printf -- '- Measured iterations: `%s`\n' "${ITERS}"
+  printf -- '- NCCL baseline: `%s`\n' "${NCCL_BASELINE_LIB}"
+  printf -- '- Generated: `%s`\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+} >"${RESULT_FILE}"
+
+awk '
+  /^(allgather|allreduce|reducescatter)[[:space:]]/ {
+    collective = $1
+    row = ++count[collective]
+    for (i = 2; i <= NF; ++i) {
+      split($i, field, "=")
+      value[collective, row, field[1]] = field[2]
+    }
+  }
+  END {
+    order[1] = "allgather"
+    order[2] = "allreduce"
+    order[3] = "reducescatter"
+    title["allgather"] = "AllGather"
+    title["allreduce"] = "AllReduce"
+    title["reducescatter"] = "ReduceScatter"
+    for (section = 1; section <= 3; ++section) {
+      collective = order[section]
+      printf "\n## %s\n\n", title[collective]
+      print "| Bytes per rank | GPU avg device (us) | GPU avg E2E (us) | NCCL avg device (us) | NCCL avg E2E (us) | Avg E2E speedup |"
+      print "|---:|---:|---:|---:|---:|---:|"
+      for (row = 1; row <= count[collective]; ++row) {
+        speedup = value[collective, row, "avg_speedup_e2e"]
+        printf "| %s | %s | %s | %s | %s | %s |\n", \
+          value[collective, row, "bytes_per_rank"], \
+          value[collective, row, "gpu_avg_device_us"], \
+          value[collective, row, "gpu_avg_e2e_us"], \
+          value[collective, row, "nccl_avg_device_us"], \
+          value[collective, row, "nccl_avg_e2e_us"], speedup
+      }
+    }
+  }
+' "${RAW_OUTPUT}" >>"${RESULT_FILE}"
+
+echo "[gpu-driven-benchmark] Markdown result: ${RESULT_FILE}" >&2
