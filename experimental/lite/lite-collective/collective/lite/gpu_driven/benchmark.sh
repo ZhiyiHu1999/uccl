@@ -12,7 +12,7 @@ HOSTS="${HOSTS:-}"
 WARMUP_ITERS="${WARMUP_ITERS:-20}"
 ITERS="${ITERS:-100}"
 RESULT_DIR="${RESULT_DIR:-${PROJECT_DIR}/.tmp/gpu-driven-benchmarks}"
-RESULT_FILE="${RESULT_FILE:-${RESULT_DIR}/gpu-driven-${UCCL_GPU_DRIVEN_BACKEND}-${NP}ranks-$(date +%Y%m%d-%H%M%S).md}"
+RESULT_FILE="${RESULT_FILE:-${RESULT_DIR}/gpu-driven-${UCCL_GPU_DRIVEN_BACKEND}-${NP}ranks.md}"
 
 find_nccl_baseline_lib() {
   if [[ -n "${NCCL_BASELINE_LIB:-}" ]]; then
@@ -113,7 +113,6 @@ trap 'rm -f "${RAW_OUTPUT}"' EXIT
   printf -- '- Warmup iterations: `%s`\n' "${WARMUP_ITERS}"
   printf -- '- Measured iterations: `%s`\n' "${ITERS}"
   printf -- '- NCCL baseline: `%s`\n' "${NCCL_BASELINE_LIB}"
-  printf -- '- Generated: `%s`\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
 } >"${RESULT_FILE}"
 
 awk '
