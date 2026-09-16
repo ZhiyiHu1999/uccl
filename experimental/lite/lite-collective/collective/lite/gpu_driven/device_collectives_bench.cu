@@ -191,12 +191,6 @@ static const char* collectiveName(BenchCollective collective) {
   return "unknown";
 }
 
-static float percentile(std::vector<float> values, double fraction) {
-  std::sort(values.begin(), values.end());
-  size_t index = static_cast<size_t>(fraction * (values.size() - 1));
-  return values[index];
-}
-
 static Sample launchGpuDrivenOnce(BenchCollective collective,
                                   mscclppDeviceAllGatherHandle_t handle,
                                   const float* input, float* output,
@@ -360,14 +354,11 @@ static void runComparison(BenchCollective collective, size_t bytes,
     float ncclE2e = mean(ncclEndToEndTimes);
     std::printf(
         "%-14s bytes_per_rank=%-8zu "
-        "gpu_device_us=%8.3f gpu_e2e_us=%8.3f gpu_p50_us=%8.3f "
-        "gpu_p95_us=%8.3f nccl_device_us=%8.3f nccl_e2e_us=%8.3f "
-        "nccl_p50_us=%8.3f nccl_p95_us=%8.3f speedup_e2e=%6.3fx\n",
+        "gpu_avg_device_us=%8.3f gpu_avg_e2e_us=%8.3f "
+        "nccl_avg_device_us=%8.3f nccl_avg_e2e_us=%8.3f "
+        "avg_speedup_e2e=%6.3fx\n",
         collectiveName(collective), bytes, mean(gpuDeviceTimes), gpuE2e,
-        percentile(gpuEndToEndTimes, 0.50),
-        percentile(gpuEndToEndTimes, 0.95), mean(ncclDeviceTimes), ncclE2e,
-        percentile(ncclEndToEndTimes, 0.50),
-        percentile(ncclEndToEndTimes, 0.95), ncclE2e / gpuE2e);
+        mean(ncclDeviceTimes), ncclE2e, ncclE2e / gpuE2e);
     std::fflush(stdout);
   }
 
