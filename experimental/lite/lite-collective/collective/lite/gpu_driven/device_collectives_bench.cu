@@ -354,9 +354,9 @@ static void runComparison(BenchCollective collective, size_t bytes,
     float ncclE2e = mean(ncclEndToEndTimes);
     std::printf(
         "%-14s bytes_per_rank=%-8zu "
-        "gpu_avg_device_us=%8.3f gpu_avg_e2e_us=%8.3f "
-        "nccl_avg_device_us=%8.3f nccl_avg_e2e_us=%8.3f "
-        "avg_speedup_e2e=%6.3fx\n",
+        "gpu_avg_device_us=%.3f gpu_avg_e2e_us=%.3f "
+        "nccl_avg_device_us=%.3f nccl_avg_e2e_us=%.3f "
+        "avg_speedup_e2e=%.3fx\n",
         collectiveName(collective), bytes, mean(gpuDeviceTimes), gpuE2e,
         mean(ncclDeviceTimes), ncclE2e, ncclE2e / gpuE2e);
     std::fflush(stdout);

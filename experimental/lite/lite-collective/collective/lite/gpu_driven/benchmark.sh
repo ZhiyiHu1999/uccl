@@ -122,7 +122,11 @@ awk '
     row = ++count[collective]
     for (i = 2; i <= NF; ++i) {
       split($i, field, "=")
-      value[collective, row, field[1]] = field[2]
+      key = field[1]
+      parsed = field[2]
+      # Accept both key=value and the older padded key=  value format.
+      if (parsed == "" && i < NF) parsed = $(++i)
+      value[collective, row, key] = parsed
     }
   }
   END {
