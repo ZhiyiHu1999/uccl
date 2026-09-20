@@ -25,6 +25,7 @@
 #include "algorithm.hpp"
 #include "algorithm_selector.hpp"
 #include "allgather.hpp"
+#include "lite/gpu_driven/gpu_collectives.cuh"
 #include "allreduce.hpp"
 #include "alltoall.hpp"
 #include "broadcast.hpp"
@@ -1323,6 +1324,7 @@ static NcclSendRecvPeerContext& getSendRecvPeerContext(ncclComm_t comm,
 }
 
 #include "../collective/lite/allgather_intranode.cu"
+#include "../collective/lite/gpu_driven/host_context.hpp"
 
 static ncclResult_t executeGroupedCudaIpcRecvEventImpl(
     void* recvbuff, size_t count, ncclDataType_t datatype, int peer,
@@ -1873,6 +1875,7 @@ NCCL_API ncclResult_t ncclCommDestroy(ncclComm_t comm) {
   cleanupAllToAllContexts(comm);
   cleanupHostAllGatherContexts(comm);
   cleanupGpuAllGatherContexts(comm);
+  cleanupDeviceCollectiveContext(comm);
   mscclpp::nccl::cleanupNativeCollectiveContexts(comm);
   delete comm;
   return ncclSuccess;
