@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+for argument in "$@"; do
+  if [[ "$argument" == -h || "$argument" == --help ]]; then
+    cat <<'USAGE'
+Usage: benchmark.sh [sizes...]
+       benchmark.sh -b BEGIN -e END [-f FACTOR] [-g 1] [-w WARMUPS] [-n ITERS]
+Sizes: bytes or B/K/M/G suffixes (binary units).
+Both bounds are required. Multiply by integer FACTOR >= 2 (default 2) while <= END.
+Do not mix ranges with positional sizes. Only -g 1 (one GPU per MPI process).
+-w >= 0 and -n >= 1 override WARMUP_ITERS/ITERS (defaults 20/100).
+NP selects MPI rank count. Bytes mean AG input, AR full tensor, RS output shard.
+The entire MPI execution has a 15-second timeout; split long sweeps if needed.
+USAGE
+    exit 0
+  fi
+done
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 MPI_HOME="${MPI_HOME:-/usr/mpi/gcc/openmpi-4.1.7rc1}"
@@ -69,6 +85,10 @@ export NCCL_BASELINE_LIB
 export WARMUP_ITERS ITERS
 export LD_LIBRARY_PATH="${PROJECT_DIR}/nccl/build:${PROJECT_DIR}/build:${CUDA_HOME:-/usr/local/cuda}/lib64:${MPI_HOME}/lib:${LD_LIBRARY_PATH:-}"
 
+# Use the executable's parser before MPI/CUDA initialization and record CLI overrides.
+BENCH_CONFIG="$("${PROJECT_DIR}/nccl/build/device_collectives_bench" --print-config "$@")"
+read -r WARMUP_ITERS ITERS <<<"${BENCH_CONFIG}"
+
 MPI_ARGS=(-np "${NP}" --bind-to none)
 if [[ -n "${HOSTS}" ]]; then
   IFS=',' read -r -a HOST_ARRAY <<<"${HOSTS}"
@@ -118,6 +138,9 @@ timeout 15s "${MPI_HOME}/bin/mpirun" "${MPI_ARGS[@]}" \
   printf -- '- CUDA devices per node: `%s`\n' "${CUDA_VISIBLE_DEVICES}"
   printf -- '- Warmup iterations: `%s`\n' "${WARMUP_ITERS}"
   printf -- '- Measured iterations: `%s`\n' "${ITERS}"
+  printf -- '- Arguments:'
+  printf ' %q' "$@"
+  printf '\n'
   printf -- '- NCCL baseline: `%s`\n' "${NCCL_BASELINE_LIB}"
 } >"${RESULT_FILE}"
 

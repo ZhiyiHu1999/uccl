@@ -29,6 +29,41 @@ invoked automatically by `benchmark.sh`.
 
 Set `NCCL_BASELINE_LIB` to an actual native NCCL library, not the UCCL compatibility library. The benchmark sets NCCL's minimum/maximum CTAs and channels to one, and disables GDR before either communicator is initialized. The GPU routine launches exactly one CTA. Confirm actual native NCCL kernel grid dimensions with a profiler on the selected NCCL version before claiming a measured one-SM comparison.
 
+## Size sweeps and command-line options
+
+Both `benchmark.sh` and `device_collectives_bench` accept
+`-b BEGIN -e END -f FACTOR -g 1 -w WARMUPS -n ITERS`.
+Both bounds are required. The default factor is 2 (integer >= 2); multiply until
+exceeding END, including END only if the progression reaches it. Sizes accept
+case-insensitive binary `B/K/M/G` suffixes. Positional sizes remain supported in
+order, but cannot be mixed with ranges. Only one GPU per MPI process (`-g 1`)
+is supported; `NP` sets the process count. CLI `-w/-n` override environment
+settings. `-h`/`--help` displays usage; script help requires no build.
+
+```sh
+# Host mode: powers of two from 128 B through 1 GiB.
+NP=2 CUDA_VISIBLE_DEVICES=0,1 bash collective/lite/gpu_driven/benchmark.sh \
+  -g 1 -b 128B -e 1G -f 2 -w 1 -n 3
+
+# CUDA IPC: two-rank AllGather skips per-rank input below 4 MiB.
+NP=2 CUDA_VISIBLE_DEVICES=0,1 UCCL_GPU_DRIVEN_BACKEND=cuda_ipc \
+  MSCCLPP_NCCL_HOST_ALLGATHER=0 MSCCLPP_NCCL_CUDAIPC_EVENT_SYNC=1 \
+  bash collective/lite/gpu_driven/benchmark.sh \
+  -g 1 -b 128B -e 1G -f 2 -w 1 -n 3
+
+# Small-message latency and a single large-message throughput point.
+NP=2 bash collective/lite/gpu_driven/benchmark.sh -b 128 -e 64K -f 2 -w 100 -n 1000
+NP=2 bash collective/lite/gpu_driven/benchmark.sh -b 256M -e 256M -w 20 -n 50
+```
+
+The entire MPI run, including initialization/preflight, remains limited to 15
+seconds. Split ranges or explicitly choose fewer iterations if needed; timeout
+is not a completed sweep. Set distinct `RESULT_FILE` values to retain separate
+reports. Bytes denote AllGather input, AllReduce full input/output, and
+ReduceScatter output shard per rank; RS input is that size times rank count.
+Staging capacity is allocated from the maximum requested size times rank count,
+so large sweeps require additional memory beyond input/output allocations.
+
 ## Bounded benchmark runs
 
 `benchmark.sh` includes a 15-second MPI execution timeout. Use targeted sizes and small iteration counts for initial checks; split long matrices across invocations. A timeout is a failure, not a result. Set `MPI_HOME`, `NCCL_BASELINE_LIB`, NIC/bootstrap variables and host names for the testbed. Forwarded host tuning variables are listed in the script.

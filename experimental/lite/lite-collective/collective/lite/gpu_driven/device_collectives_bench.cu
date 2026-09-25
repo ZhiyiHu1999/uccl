@@ -1,4 +1,5 @@
 #include "gpu_collectives.cuh"
+#include "benchmark_options.hpp"
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -239,28 +240,6 @@ __global__ void reduceScatterBenchKernel(mscclppDeviceCollectiveHandle_t handle,
   int rc =
       liteReduceScatterBlock(handle, input, output, recvCount, liteReduceSum);
   if (threadIdx.x == 0 && rc) atomicCAS(status, 0, rc);
-}
-
-static size_t parseSize(char const* text) {
-  if (!text || *text < '0' || *text > '9') return 0;
-  char* end = nullptr;
-  errno = 0;
-  unsigned long long value = std::strtoull(text, &end, 10);
-  if (errno || end == text || !value) return 0;
-  size_t scale = 1;
-  if (*end) {
-    if (end[1]) return 0;
-    if (*end == 'K' || *end == 'k')
-      scale = 1024;
-    else if (*end == 'M' || *end == 'm')
-      scale = 1024 * 1024;
-    else if (*end == 'G' || *end == 'g')
-      scale = size_t{1} << 30;
-    else
-      return 0;
-  }
-  if (value > std::numeric_limits<size_t>::max() / scale) return 0;
-  return static_cast<size_t>(value) * scale;
 }
 
 static char const* collectiveName(BenchCollective collective) {
@@ -554,6 +533,20 @@ static void runComparison(BenchCollective collective, size_t bytes, int warmups,
 }
 
 int main(int argc, char** argv) {
+  LiteBenchmarkOptions options;
+  std::string optionError;
+  if (!liteParseBenchmarkOptions(argc, argv, options, optionError)) {
+    std::fprintf(stderr, "%s\n%s", optionError.c_str(), liteBenchmarkUsage);
+    return 1;
+  }
+  if (options.help) {
+    std::printf("%s", liteBenchmarkUsage);
+    return 0;
+  }
+  if (options.printConfig) {
+    std::printf("%d %d\n", options.warmups, options.iterations);
+    return 0;
+  }
   // Configure before either NCCL library creates a communicator. One channel
   // and one CTA constrain native NCCL to the same one-SM execution budget.
   setenv("NCCL_MIN_CTAS", "1", 1);
@@ -583,26 +576,9 @@ int main(int argc, char** argv) {
   }
   CUDA_CHECK(cudaSetDevice(localRank));
 
-  int warmups = 20;
-  int iterations = 100;
-  if (char const* value = std::getenv("WARMUP_ITERS")) {
-    warmups = std::max(0, std::atoi(value));
-  }
-  if (char const* value = std::getenv("ITERS")) {
-    iterations = std::max(1, std::atoi(value));
-  }
-  std::vector<size_t> sizes{128, 256, 512, 1024, 4096, 16384, 65536};
-  if (argc > 1) {
-    sizes.clear();
-    for (int i = 1; i < argc; ++i) {
-      size_t bytes = parseSize(argv[i]);
-      if (bytes == 0) {
-        if (rank == 0) std::fprintf(stderr, "invalid size: %s\n", argv[i]);
-        MPI_Abort(MPI_COMM_WORLD, 1);
-      }
-      sizes.push_back(bytes);
-    }
-  }
+  int warmups = options.warmups;
+  int iterations = options.iterations;
+  auto const& sizes = options.sizes;
 
   size_t largestBytes = *std::max_element(sizes.begin(), sizes.end());
   if (largestBytes >
