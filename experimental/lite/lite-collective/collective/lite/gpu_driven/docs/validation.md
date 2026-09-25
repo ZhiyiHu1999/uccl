@@ -17,10 +17,15 @@ Temporary validation harnesses were kept outside the source tree. Per AGENTS.md,
 From `experimental/lite/lite-collective`:
 
 ```sh
-make collective
-make -C nccl
-make -C nccl device-collectives-bench
+make all
+make -C nccl all
 ```
+
+`make -C nccl all` builds the compatibility libraries and the GPU-driven
+benchmark at `nccl/build/device_collectives_bench`; it requires MPI as well as
+CUDA. Set `MPI_HOME` (or `MPI_CXX`) for a non-default MPI installation.
+The standalone `device-collectives-bench` target remains available and is also
+invoked automatically by `benchmark.sh`.
 
 Set `NCCL_BASELINE_LIB` to an actual native NCCL library, not the UCCL compatibility library. The benchmark sets NCCL's minimum/maximum CTAs and channels to one, and disables GDR before either communicator is initialized. The GPU routine launches exactly one CTA. Confirm actual native NCCL kernel grid dimensions with a profiler on the selected NCCL version before claiming a measured one-SM comparison.
 

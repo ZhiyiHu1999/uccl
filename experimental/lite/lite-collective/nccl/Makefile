@@ -50,7 +50,7 @@ NVCC_LDLIBS := -Xlinker --no-as-needed -lmint_collective -lmint -lcudart -lcuda 
 
 .PHONY: all clean mint-deps device-collectives-bench
 
-all: mint-deps $(LIB_NCCL_SO) $(LIB_NCCL_A) $(LIB_AUDIT_SO)
+all: mint-deps $(LIB_NCCL_SO) $(LIB_NCCL_A) $(LIB_AUDIT_SO) device-collectives-bench
 
 mint-deps:
 	$(MAKE) -C $(MINT_DIR) core collective
