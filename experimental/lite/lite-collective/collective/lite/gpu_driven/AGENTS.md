@@ -195,6 +195,25 @@ TBD
 
 TBD
 
+### Benchmark command-line requirements
+
+- Support `-c/--collective allgather|allreduce|reducescatter|all` (default `all`).
+  Execute correctness preflight, warmup, timing, and NCCL comparison only for the
+  selected collective; reports must omit unselected sections. AllGather-only
+  validation must not run reductions or reserve their extra input capacity.
+- The script and executable must support nccl-tests-style sweeps with
+  `-b BEGIN -e END -f FACTOR`, binary size suffixes `B/K/M/G` (case-insensitive),
+  `-w WARMUPS`, `-n ITERS`, and `-g 1` (one GPU per MPI process).
+- Require both range bounds. Multiply by an integer factor >= 2 (default 2)
+  while within the inclusive end bound; prevent arithmetic overflow.
+- Preserve positional size lists and their order, including repeated sizes.
+  Reject mixing ranges with positional sizes, invalid values and unsupported GPU counts.
+- CLI iteration counts override environment defaults. Reports must record the
+  effective counts. Help must work without GPU initialization.
+- Do not impose a fixed wall-clock timeout on benchmark runs. Honor requested
+  ranges and iteration counts; never silently reduce iterations or treat skipped
+  paths/interrupted runs as successful measurements.
+
 ## Scope and working approach
 
 - Implement device-callable collectives (AllGather, ReduceScatter, AllReduce) that can run inside a user CUDA kernel after one collective host initialization.
@@ -207,25 +226,6 @@ TBD
 - For a feature request, identify the affected collective, backend, message-size range, and execution model from the request and current code. State reasonable assumptions and proceed; ask only when an unresolved choice changes required behavior or compatibility.
 - Treat current limits as implementation boundaries, not permanent prohibitions. If a requested feature expands them, update device code, host setup, validation, and documentation together.
 - If this `AGENTS.md` got updated, and the code base has been generated based on the previous version of `AGENTS.md`, all temporary compromising restricted to previous AGENTS.md should be abandoned for next run, anddevote .
-
-## Benchmark command-line requirements
-
-- Support `-c/--collective allgather|allreduce|reducescatter|all` (default `all`).
-  Execute correctness preflight, warmup, timing, and NCCL comparison only for the
-  selected collective; reports must omit unselected sections. AllGather-only
-  validation must not run reductions or reserve their extra input capacity.
-
-- The script and executable must support nccl-tests-style sweeps with
-  `-b BEGIN -e END -f FACTOR`, binary size suffixes `B/K/M/G` (case-insensitive),
-  `-w WARMUPS`, `-n ITERS`, and `-g 1` (one GPU per MPI process).
-- Require both range bounds. Multiply by an integer factor >= 2 (default 2)
-  while within the inclusive end bound; prevent arithmetic overflow.
-- Preserve positional size lists and their order, including repeated sizes.
-  Reject mixing ranges with positional sizes, invalid values and unsupported GPU counts.
-- CLI iteration counts override environment defaults. Reports must record the
-  effective counts. Help must work without GPU initialization.
-- Keep the 15-second execution limit explicit. Never silently reduce requested
-  iterations or treat skipped paths/timeouts as successful measurements.
 
 ## Finish the task
 

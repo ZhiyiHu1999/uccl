@@ -12,7 +12,7 @@ Both bounds are required. Multiply by integer FACTOR >= 2 (default 2) while <= E
 Do not mix ranges with positional sizes. Only -g 1 (one GPU per MPI process).
 -w >= 0 and -n >= 1 override WARMUP_ITERS/ITERS (defaults 20/100).
 NP selects MPI rank count. Bytes mean AG input, AR full tensor, RS output shard.
-The entire MPI execution has a 15-second timeout; split long sweeps if needed.
+No fixed wall-clock timeout is imposed on the MPI run.
 USAGE
     exit 0
   fi
@@ -122,7 +122,7 @@ mkdir -p "$(dirname "${RESULT_FILE}")"
 RAW_OUTPUT="$(mktemp "${TMPDIR:-/tmp}/gpu-driven-benchmark.XXXXXX")"
 trap 'rm -f "${RAW_OUTPUT}"' EXIT
 
-timeout 15s "${MPI_HOME}/bin/mpirun" "${MPI_ARGS[@]}" \
+"${MPI_HOME}/bin/mpirun" "${MPI_ARGS[@]}" \
   -x CUDA_VISIBLE_DEVICES \
   -x UCCL_GPU_DRIVEN_BACKEND \
   -x NCCL_BASELINE_LIB \

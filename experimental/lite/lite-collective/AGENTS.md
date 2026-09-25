@@ -143,4 +143,5 @@ explicitly state unverified items in the commit message.
 
 ## Debugging
 
-- When running test scripts, set `timeout` to at most **15 seconds**.
+- Do not impose a fixed wall-clock timeout on benchmark runs. Allow requested
+  size sweeps and iteration counts to complete; users may interrupt runs explicitly.
