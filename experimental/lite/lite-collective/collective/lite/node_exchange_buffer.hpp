@@ -49,6 +49,14 @@ static constexpr int kNebMaxRanks = 8;  // max local ranks per node
 // CPU reads via waitCpu() spin loop.
 struct NebCtrl {
   alignas(64) volatile uint64_t d2hReady[kNebMaxRanks];
+  alignas(64) volatile uint64_t gpuReady[2][kNebMaxRanks];
+  alignas(64) volatile uint64_t gpuBytes[2][kNebMaxRanks];
+  alignas(64) volatile uint64_t gpuDone[2][kNebMaxRanks];
+  alignas(64) volatile uint64_t rxReady[2];
+  alignas(64) volatile uint64_t slotReusable[2];
+  alignas(64) volatile uint64_t remoteAck[2];
+  alignas(64) uint64_t rxSignal[2];
+  alignas(64) uint64_t ackSignal[2];
 };
 static_assert(sizeof(NebCtrl) <= 4096, "NebCtrl fits in one page");
 
@@ -108,6 +116,10 @@ class NodeExchangeBuffer {
 
   // Host pointer into recvSlab at byte offset.
   char* recvPtr(size_t offset = 0) const { return recvSlab_ + offset; }
+  char const* recvDevicePtr() const { return recvDevice_; }
+
+  NebCtrl* control() const { return ctrl_; }
+  char* controlDevicePtr() const { return ctrlDevice_; }
 
   size_t slabBytes() const { return slabBytes_; }
 
@@ -122,6 +134,7 @@ class NodeExchangeBuffer {
     std::swap(recvMapping_,    o.recvMapping_);
     std::swap(recvSlab_,       o.recvSlab_);
     std::swap(recvRegistered_, o.recvRegistered_);
+    std::swap(recvDevice_,     o.recvDevice_);
     std::swap(ctrlMapping_,    o.ctrlMapping_);
     std::swap(ctrl_,           o.ctrl_);
     std::swap(ctrlDevice_,     o.ctrlDevice_);
@@ -143,6 +156,7 @@ class NodeExchangeBuffer {
   void*  recvMapping_   = nullptr;
   char*  recvSlab_      = nullptr;
   bool   recvRegistered_ = false;
+  char*  recvDevice_     = nullptr;
 
   // D2H ctrl flags (device-mapped)
   void*    ctrlMapping_    = nullptr;
@@ -362,9 +376,22 @@ inline NodeExchangeBuffer NodeExchangeBuffer::create(
     }
     buf.sendRegistered_ = true;
 
-    // Register recvSlab: portable-only (RDMA writes here, no GPU-kernel access).
-    MSCCLPP_CUDATHROW(cudaHostRegister(buf.recvMapping_, slabBytes,
-                                       cudaHostRegisterPortable));
+    // Register recvSlab mapped so GPU-driven collectives can directly consume
+    // data deposited by the inter-node RDMA proxy.
+    cudaError_t recvReg = cudaHostRegister(
+        buf.recvMapping_, slabBytes,
+        cudaHostRegisterPortable | cudaHostRegisterMapped);
+    if (recvReg == cudaSuccess) {
+      void* recvDevice = nullptr;
+      MSCCLPP_CUDATHROW(
+          cudaHostGetDevicePointer(&recvDevice, buf.recvMapping_, 0));
+      buf.recvDevice_ = static_cast<char*>(recvDevice);
+    } else {
+      cudaGetLastError();
+      MSCCLPP_CUDATHROW(cudaHostRegister(buf.recvMapping_, slabBytes,
+                                         cudaHostRegisterPortable));
+      buf.recvDevice_ = nullptr;
+    }
     buf.recvRegistered_ = true;
 
     // Register ctrl: device-mapped for cuStreamWriteValue64.
