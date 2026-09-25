@@ -352,7 +352,7 @@ static void runComparison(BenchCollective collective, size_t bytes, int warmups,
       litePlanAllGather(handle.allGatherPolicy, nranks, handle.ranksPerNode,
                         handle.backend == mscclppDeviceCollectiveCudaIpc, true,
                         handle.maxBytesPerRank, bytes, 0)
-              .path == LiteAllGatherPath::Unsupported) {
+              .path == LiteDeviceAllGatherPath::Unsupported) {
     if (!rank)
       std::printf(
           "allgather bytes_per_rank=%zu skipped: outside selected backend "

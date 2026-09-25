@@ -22,7 +22,7 @@ struct LiteAllGatherPolicy {
   int cooperative = 0;
 };
 
-enum class LiteAllGatherPath {
+enum class LiteDeviceAllGatherPath {
   Unsupported,
   Copy,
   IpcRing,
@@ -37,7 +37,7 @@ enum class LiteAllGatherPath {
 };
 
 struct LiteAllGatherPlan {
-  LiteAllGatherPath path = LiteAllGatherPath::Unsupported;
+  LiteDeviceAllGatherPath path = LiteDeviceAllGatherPath::Unsupported;
   size_t chunkBytes = 0;
   bool stageWithSm = false;
   bool receiveWithSm = false;
@@ -55,7 +55,7 @@ LITE_PLAN_HD inline LiteAllGatherPlan litePlanAllGather(
     return p;
   size_t total = bytes * static_cast<size_t>(nranks);
   if (nranks == 1) {
-    p.path = LiteAllGatherPath::Copy;
+    p.path = LiteDeviceAllGatherPath::Copy;
     p.chunkBytes = bytes;
     return p;
   }
@@ -64,7 +64,7 @@ LITE_PLAN_HD inline LiteAllGatherPlan litePlanAllGather(
     if (ipc) {
       if (!policy.hostEnabled && policy.ipcEventSync &&
           total >= 8 * 1024 * 1024) {
-        p.path = LiteAllGatherPath::IpcRing;
+        p.path = LiteDeviceAllGatherPath::IpcRing;
         p.chunkBytes = bytes < 1024 * 1024 ? bytes : 1024 * 1024;
         p.stageWithSm = p.receiveWithSm = true;
       }
@@ -82,21 +82,21 @@ LITE_PLAN_HD inline LiteAllGatherPlan litePlanAllGather(
                                              : bytes;
     }
     p.chunkBytes = chunk;
-    p.path = LiteAllGatherPath::HostDma;
+    p.path = LiteDeviceAllGatherPath::HostDma;
     bool vector = !(alignment & 7) && !(bytes & 7) && chunk == bytes &&
                   mapped && policy.mapSlab;
     if (vector && total <= policy.kernelMaxBytes)
-      p.path = LiteAllGatherPath::HostMapped;
+      p.path = LiteDeviceAllGatherPath::HostMapped;
     else if (vector && policy.cooperative && total <= policy.coopMaxBytes)
-      p.path = LiteAllGatherPath::HostCooperative;
-    p.stageWithSm = p.receiveWithSm = p.path != LiteAllGatherPath::HostDma;
+      p.path = LiteDeviceAllGatherPath::HostCooperative;
+    p.stageWithSm = p.receiveWithSm = p.path != LiteDeviceAllGatherPath::HostDma;
     return p;
   }
   if (nranks != 2 * ranksPerNode || ipc) return p;
   size_t smallLimit = ranksPerNode == 1 ? 2 * 1024 * 1024 : 128 * 1024;
   if (total < smallLimit) {
-    p.path = mapped ? LiteAllGatherPath::OrderedSmall
-                    : LiteAllGatherPath::SmallFallback;
+    p.path = mapped ? LiteDeviceAllGatherPath::OrderedSmall
+                    : LiteDeviceAllGatherPath::SmallFallback;
     p.chunkBytes = bytes;
     if (ranksPerNode == 1 && total < 64 * 1024 && mapped) {
       p.stageWithSm = p.receiveWithSm = true;
@@ -111,14 +111,14 @@ LITE_PLAN_HD inline LiteAllGatherPlan litePlanAllGather(
     return p;
   }
   if (ranksPerNode > 2 && nicGroups > 1) {
-    p.path = LiteAllGatherPath::NumaSplit;
+    p.path = LiteDeviceAllGatherPath::NumaSplit;
     p.chunkBytes = bytes < 16 * 1024 * 1024 ? bytes : 16 * 1024 * 1024;
     return p;
   }
-  p.path = LiteAllGatherPath::SingleSlab;
+  p.path = LiteDeviceAllGatherPath::SingleSlab;
   p.chunkBytes = ranksPerNode == 2 ? 512 * 1024 : 2 * 1024 * 1024;
   if (ranksPerNode == 1 && bytes >= 1024 * 1024 && bytes <= (size_t{1} << 30)) {
-    p.path = LiteAllGatherPath::OneRankPipeline;
+    p.path = LiteDeviceAllGatherPath::OneRankPipeline;
     p.chunkBytes = 512 * 1024;
   }
   return p;

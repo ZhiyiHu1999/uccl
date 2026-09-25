@@ -773,6 +773,10 @@ mscclppGetDeviceCollectiveHandle(ncclComm_t comm, size_t maxBytesPerRank,
     cudaDeviceProp properties{};
     MSCCLPP_CUDATHROW(cudaGetDeviceProperties(&properties, comm->cudaDevice));
     policy.cooperative = properties.cooperativeLaunch;
+    // Query the attribute instead of the removed cudaDeviceProp field.
+    int clockRateKHz = 0;
+    MSCCLPP_CUDATHROW(cudaDeviceGetAttribute(
+        &clockRateKHz, cudaDevAttrClockRate, comm->cudaDevice));
     configs[rank] = {maxBytesPerRank,
                      static_cast<int>(backend),
                      comm->cudaDevice,
@@ -846,7 +850,7 @@ mscclppGetDeviceCollectiveHandle(ncclComm_t comm, size_t maxBytesPerRank,
       context->dualRail = twoNodes && configs[0].ibCount > 1 &&
                           configs[nRanksPerNode].ibCount > 1;
       context->timeoutCycles =
-          static_cast<unsigned long long>(properties.clockRate) * 1000ULL *
+          static_cast<unsigned long long>(clockRateKHz) * 1000ULL *
           30ULL;
       context->stopRdmaProxy.store(false, std::memory_order_release);
       context->rank = rank;

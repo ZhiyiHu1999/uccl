@@ -468,11 +468,11 @@ static __device__ __forceinline__ int liteAllGatherBlock(
                                 reinterpret_cast<uintptr_t>(srcVoid) |
                                     reinterpret_cast<uintptr_t>(dstVoid),
                                 graphCaptured, h.groupCount);
-  if (plan.path == LiteAllGatherPath::Unsupported)
+  if (plan.path == LiteDeviceAllGatherPath::Unsupported)
     return mscclppDeviceCollectiveInvalidUsage;
   auto* dst = static_cast<char*>(dstVoid);
   auto* src = static_cast<char const*>(srcVoid);
-  if (plan.path == LiteAllGatherPath::Copy) {
+  if (plan.path == LiteDeviceAllGatherPath::Copy) {
     if (src != dst) liteCollectiveCopyBlock(dst, src, bytesPerRank);
     __syncthreads();
     return mscclppDeviceCollectiveSuccess;
@@ -483,14 +483,14 @@ static __device__ __forceinline__ int liteAllGatherBlock(
                  totalBytes != 128 && totalBytes != 256;
   uint64_t networkFlags = network ? kLitePackedNetworkBit : 0;
   if (compact) networkFlags |= kLiteCompactNetworkBit;
-  if (plan.path == LiteAllGatherPath::SingleSlab && !useNuma)
+  if (plan.path == LiteDeviceAllGatherPath::SingleSlab && !useNuma)
     networkFlags |= kLiteGenericNetworkBit;
-  bool small = plan.path == LiteAllGatherPath::OrderedSmall ||
-               plan.path == LiteAllGatherPath::SmallFallback;
+  bool small = plan.path == LiteDeviceAllGatherPath::OrderedSmall ||
+               plan.path == LiteDeviceAllGatherPath::SmallFallback;
   bool inPlace = src == dst + static_cast<size_t>(h.rank) * bytesPerRank;
   bool packedReceive =
       !plan.receiveWithSm && small &&
-      (plan.path == LiteAllGatherPath::SmallFallback || h.ranksPerNode != 1 ||
+      (plan.path == LiteDeviceAllGatherPath::SmallFallback || h.ranksPerNode != 1 ||
        (!(inPlace || totalBytes >= 128 * 1024) || totalBytes == 32 * 1024));
   __shared__ unsigned long long epochs[2];
   __shared__ int slots[2];
@@ -589,7 +589,7 @@ static __device__ __forceinline__ int liteAllGatherBlock(
     char* self = dst + static_cast<size_t>(h.rank) * bytesPerRank + offset;
     if (!packedReceive && !preCopySelf && self != src + offset)
       liteCollectiveCopyBlock(self, src + offset, bytes, plan.activeThreads);
-    if (plan.path == LiteAllGatherPath::IpcRing) {
+    if (plan.path == LiteDeviceAllGatherPath::IpcRing) {
       int previous = (h.rank + h.nranks - 1) % h.nranks;
       int next = (h.rank + 1) % h.nranks;
       for (int hop = 1; hop < h.nranks; ++hop) {
