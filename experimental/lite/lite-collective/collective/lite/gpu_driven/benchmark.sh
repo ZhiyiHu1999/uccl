@@ -6,6 +6,7 @@ for argument in "$@"; do
     cat <<'USAGE'
 Usage: benchmark.sh [sizes...]
        benchmark.sh -b BEGIN -e END [-f FACTOR] [-g 1] [-w WARMUPS] [-n ITERS]
+-c, --collective: allgather/allreduce/reducescatter/all (default all).
 Sizes: bytes or B/K/M/G suffixes (binary units).
 Both bounds are required. Multiply by integer FACTOR >= 2 (default 2) while <= END.
 Do not mix ranges with positional sizes. Only -g 1 (one GPU per MPI process).
@@ -87,7 +88,7 @@ export LD_LIBRARY_PATH="${PROJECT_DIR}/nccl/build:${PROJECT_DIR}/build:${CUDA_HO
 
 # Use the executable's parser before MPI/CUDA initialization and record CLI overrides.
 BENCH_CONFIG="$("${PROJECT_DIR}/nccl/build/device_collectives_bench" --print-config "$@")"
-read -r WARMUP_ITERS ITERS <<<"${BENCH_CONFIG}"
+read -r WARMUP_ITERS ITERS SELECTED_COLLECTIVE <<<"${BENCH_CONFIG}"
 
 MPI_ARGS=(-np "${NP}" --bind-to none)
 if [[ -n "${HOSTS}" ]]; then
@@ -133,6 +134,7 @@ timeout 15s "${MPI_HOME}/bin/mpirun" "${MPI_ARGS[@]}" \
 
 {
   printf '# GPU-driven lite collectives vs NCCL\n\n'
+  printf -- '- Collective: `%s`\n' "${SELECTED_COLLECTIVE}"
   printf -- '- Backend: `%s`\n' "${UCCL_GPU_DRIVEN_BACKEND}"
   printf -- '- Ranks: `%s`\n' "${NP}"
   printf -- '- CUDA devices per node: `%s`\n' "${CUDA_VISIBLE_DEVICES}"
@@ -144,7 +146,7 @@ timeout 15s "${MPI_HOME}/bin/mpirun" "${MPI_ARGS[@]}" \
   printf -- '- NCCL baseline: `%s`\n' "${NCCL_BASELINE_LIB}"
 } >"${RESULT_FILE}"
 
-awk '
+awk -v selected="${SELECTED_COLLECTIVE}" '
   /^(allgather|allreduce|reducescatter)[[:space:]]/ && /gpu_avg_device_us=/ {
     collective = $1
     row = ++count[collective]
@@ -166,6 +168,7 @@ awk '
     title["reducescatter"] = "ReduceScatter"
     for (section = 1; section <= 3; ++section) {
       collective = order[section]
+      if (selected != "all" && selected != collective) continue
       printf "\n## %s\n\n", title[collective]
       print "| Bytes per rank | GPU avg device (us) | GPU avg E2E (us) | NCCL avg device (us) | NCCL avg E2E (us) | Avg E2E speedup |"
       print "|---:|---:|---:|---:|---:|---:|"

@@ -210,6 +210,11 @@ TBD
 
 ## Benchmark command-line requirements
 
+- Support `-c/--collective allgather|allreduce|reducescatter|all` (default `all`).
+  Execute correctness preflight, warmup, timing, and NCCL comparison only for the
+  selected collective; reports must omit unselected sections. AllGather-only
+  validation must not run reductions or reserve their extra input capacity.
+
 - The script and executable must support nccl-tests-style sweeps with
   `-b BEGIN -e END -f FACTOR`, binary size suffixes `B/K/M/G` (case-insensitive),
   `-w WARMUPS`, `-n ITERS`, and `-g 1` (one GPU per MPI process).

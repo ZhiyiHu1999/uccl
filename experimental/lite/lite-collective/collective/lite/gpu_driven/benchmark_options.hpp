@@ -14,6 +14,7 @@ static constexpr char liteBenchmarkUsage[] =
     "Sizes: positive bytes, optionally suffixed B/K/M/G (binary units).\n"
     "Range: multiply by FACTOR (integer >= 2, default 2) while <= END.\n"
     "Both -b and -e are required; do not mix ranges with positional sizes.\n"
+    "-c, --collective: allgather/allreduce/reducescatter/all (default all).\n"
     "-g: GPUs per MPI process; only 1 is supported.\n"
     "-w: warmups >= 0; -n: measured iterations >= 1. CLI overrides env.\n"
     "Defaults: WARMUP_ITERS=20, ITERS=100; sizes 128 256 512 1K 4K 16K 64K.\n"
@@ -21,6 +22,7 @@ static constexpr char liteBenchmarkUsage[] =
     "Bytes mean AG input, AR full input/output, RS output shard per rank.\n";
 
 struct LiteBenchmarkOptions {
+  std::string collective = "all";
   int warmups = 20;
   int iterations = 100;
   bool help = false;
@@ -73,6 +75,14 @@ inline bool liteParseBenchmarkOptions(int argc, char** argv,
     std::string arg = argv[i];
     if (arg == "--print-config") {
       out.printConfig = true;
+      continue;
+    }
+    if (arg == "-c" || arg == "--collective") {
+      if (++i == argc) return fail("Missing value for " + arg);
+      out.collective = argv[i];
+      if (out.collective != "all" && out.collective != "allgather" &&
+          out.collective != "allreduce" && out.collective != "reducescatter")
+        return fail("Invalid collective: " + out.collective);
       continue;
     }
     if (arg == "-b" || arg == "-e" || arg == "-f" || arg == "-g" ||

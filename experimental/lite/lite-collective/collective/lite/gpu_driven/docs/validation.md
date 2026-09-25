@@ -31,6 +31,22 @@ Set `NCCL_BASELINE_LIB` to an actual native NCCL library, not the UCCL compatibi
 
 ## Size sweeps and command-line options
 
+Use `-c allgather` (or `--collective allgather`) to run only AllGather, including
+its correctness preflight and native NCCL comparison. Other choices are
+`allreduce`, `reducescatter`, and `all` (the compatibility default). Unselected
+collectives are not run and are omitted from the report.
+
+```sh
+NP=2 CUDA_VISIBLE_DEVICES=0,1 UCCL_GPU_DRIVEN_BACKEND=cuda_ipc \
+  MSCCLPP_NCCL_HOST_ALLGATHER=0 MSCCLPP_NCCL_CUDAIPC_EVENT_SYNC=1 \
+  bash collective/lite/gpu_driven/benchmark.sh \
+  -c allgather -g 1 -b 4M -e 1G -f 2 -w 1 -n 3
+```
+
+Two-rank IPC AllGather requires at least 4 MiB input per rank. Starting at 128B
+is accepted but smaller ineligible sizes are skipped. The whole run still has
+a 15-second limit; split the range if necessary.
+
 Both `benchmark.sh` and `device_collectives_bench` accept
 `-b BEGIN -e END -f FACTOR -g 1 -w WARMUPS -n ITERS`.
 Both bounds are required. The default factor is 2 (integer >= 2); multiply until
@@ -61,7 +77,8 @@ seconds. Split ranges or explicitly choose fewer iterations if needed; timeout
 is not a completed sweep. Set distinct `RESULT_FILE` values to retain separate
 reports. Bytes denote AllGather input, AllReduce full input/output, and
 ReduceScatter output shard per rank; RS input is that size times rank count.
-Staging capacity is allocated from the maximum requested size times rank count,
+Staging capacity is allocated from the maximum requested size (times rank count
+when ReduceScatter is selected),
 so large sweeps require additional memory beyond input/output allocations.
 
 ## Bounded benchmark runs

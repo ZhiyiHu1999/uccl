@@ -544,7 +544,8 @@ int main(int argc, char** argv) {
     return 0;
   }
   if (options.printConfig) {
-    std::printf("%d %d\n", options.warmups, options.iterations);
+    std::printf("%d %d %s\n", options.warmups, options.iterations,
+                options.collective.c_str());
     return 0;
   }
   // Configure before either NCCL library creates a communicator. One channel
@@ -585,7 +586,10 @@ int main(int argc, char** argv) {
       (static_cast<size_t>(-1) - 32) / static_cast<size_t>(nranks)) {
     MPI_Abort(MPI_COMM_WORLD, 1);
   }
-  size_t maxStagedBytes = largestBytes * static_cast<size_t>(nranks);
+  size_t maxStagedBytes =
+      (options.collective == "all" || options.collective == "reducescatter")
+          ? largestBytes * static_cast<size_t>(nranks)
+          : largestBytes;
 
   ncclUniqueId id{};
   if (rank == 0) NCCL_CHECK(ncclGetUniqueId(&id));
@@ -641,12 +645,16 @@ int main(int argc, char** argv) {
                                                                  : "host"),
         nranks, warmups, iterations, ncclBaselinePath);
   }
+  if (rank == 0) std::printf("collective=%s\n", options.collective.c_str());
   for (size_t bytes : sizes) {
-    runComparison(BenchCollective::AllGather, bytes, warmups, iterations, rank,
+    if (options.collective == "all" || options.collective == "allgather")
+      runComparison(BenchCollective::AllGather, bytes, warmups, iterations, rank,
                   nranks, handle, ncclApi, ncclComm, ncclStream);
-    runComparison(BenchCollective::AllReduce, bytes, warmups, iterations, rank,
+    if (options.collective == "all" || options.collective == "allreduce")
+      runComparison(BenchCollective::AllReduce, bytes, warmups, iterations, rank,
                   nranks, handle, ncclApi, ncclComm, ncclStream);
-    runComparison(BenchCollective::ReduceScatter, bytes, warmups, iterations,
+    if (options.collective == "all" || options.collective == "reducescatter")
+      runComparison(BenchCollective::ReduceScatter, bytes, warmups, iterations,
                   rank, nranks, handle, ncclApi, ncclComm, ncclStream);
   }
 
