@@ -35,6 +35,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 #include <fcntl.h>
 #include <numa.h>
@@ -168,8 +169,8 @@ class CpuStagingChannel {
   // Non-copyable, moveable.
   CpuStagingChannel(CpuStagingChannel const&) = delete;
   CpuStagingChannel& operator=(CpuStagingChannel const&) = delete;
-  CpuStagingChannel(CpuStagingChannel&&) = default;
-  CpuStagingChannel& operator=(CpuStagingChannel&&) = default;
+  CpuStagingChannel(CpuStagingChannel&& other) noexcept;
+  CpuStagingChannel& operator=(CpuStagingChannel&& other) noexcept;
   ~CpuStagingChannel();
 
   // ── Stream API ─────────────────────────────────────────────────────────────
@@ -252,6 +253,27 @@ class CpuStagingChannel {
   int    nSlots_       = 0;
   bool   isLeader_     = false;
 
+  void swap_(CpuStagingChannel& other) noexcept {
+    using std::swap;
+    swap(slabBytes_, other.slabBytes_);
+    swap(slabMapping_, other.slabMapping_);
+    swap(slab_, other.slab_);
+    swap(slabDevice_, other.slabDevice_);
+    swap(slabRegistered_, other.slabRegistered_);
+    swap(slabName_, other.slabName_);
+    swap(ctrlMapping_, other.ctrlMapping_);
+    swap(ctrl_, other.ctrl_);
+    swap(ctrlDevice_, other.ctrlDevice_);
+    swap(ctrlRegistered_, other.ctrlRegistered_);
+    swap(ctrlName_, other.ctrlName_);
+    swap(rank_, other.rank_);
+    swap(nRanks_, other.nRanks_);
+    swap(bytesPerRank_, other.bytesPerRank_);
+    swap(slotStride_, other.slotStride_);
+    swap(nSlots_, other.nSlots_);
+    swap(isLeader_, other.isLeader_);
+  }
+
   // Internal helpers
   static CUdeviceptr readyFlagCuAddr_(char const* ctrlDev, int slot, int chunk, int rank) {
     size_t off = sizeof(CscCounter) * (
@@ -284,6 +306,20 @@ class CpuStagingChannel {
 };
 
 // ── Inline method implementations ────────────────────────────────────────────
+
+inline CpuStagingChannel::CpuStagingChannel(
+    CpuStagingChannel&& other) noexcept {
+  swap_(other);
+}
+
+inline CpuStagingChannel& CpuStagingChannel::operator=(
+    CpuStagingChannel&& other) noexcept {
+  if (this != &other) {
+    CpuStagingChannel replacement(std::move(other));
+    swap_(replacement);
+  }
+  return *this;
+}
 
 inline void CpuStagingChannel::put(cudaStream_t stream,
                                    int slot, int chunkId,

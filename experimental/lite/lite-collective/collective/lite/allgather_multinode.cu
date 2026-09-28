@@ -2,6 +2,7 @@
 #include "lite_common.h"
 #include "debug.h"
 #include "lite/node_exchange_buffer.hpp"
+#include "lite/gpu_driven/network_service.hpp"
 #include "lite/cpu_switch/cpu_switch.hpp"
 #include <algorithm>
 #include <array>
@@ -87,7 +88,29 @@ using mscclpp::lite::mapShm;
 using mscclpp::lite::placeOnNuma;
 using mscclpp::lite::publishInitStatus;
 using mscclpp::lite::selectIBTransportForGpu;
-using mscclpp::lite::waitForEpoch;
+// CPU callers retain their original wait implementation. Device calls also
+// observe cancellation so a timed-out caller cannot strand its service worker.
+thread_local LiteNetworkControl* activeDeviceCall = nullptr;
+void checkDeviceAllGatherAbort() {
+  if (activeDeviceCall && __atomic_load_n(&activeDeviceCall->abort, __ATOMIC_ACQUIRE))
+    throw mscclpp::Error("device AllGather aborted", mscclpp::ErrorCode::SystemError);
+}
+void waitForEpoch(std::atomic<uint64_t> const& value, uint64_t epoch) {
+  if (!activeDeviceCall) return mscclpp::lite::waitForEpoch(value, epoch);
+  int spins = 0;
+  for (;;) {
+    checkDeviceAllGatherAbort();
+    uint64_t observed = value.load(std::memory_order_acquire);
+    if (observed == UINT64_MAX)
+      throw mscclpp::Error("device AllGather peer failed", mscclpp::ErrorCode::SystemError);
+    if (observed >= epoch) return;
+    if (spins++ < kPollSpinsBeforeYield) {
+      asm volatile("pause" ::: "memory");
+    } else {
+      std::this_thread::yield();
+    }
+  }
+}
 
 struct HostControl {
   alignas(64) std::atomic<uint64_t>
@@ -492,6 +515,9 @@ void waitForSlotReady(char const* flagPtr, uint64_t epoch) {
   auto const* value = reinterpret_cast<uint64_t const volatile*>(flagPtr);
   int spins = 0;
   while (*value != epoch) {
+    checkDeviceAllGatherAbort();
+    if (activeDeviceCall && *value == UINT64_MAX)
+      throw mscclpp::Error("device AllGather peer failed", mscclpp::ErrorCode::SystemError);
     if (spins++ < kPollSpinsBeforeYield) {
       asm volatile("pause" ::: "memory");
     } else {
@@ -504,6 +530,7 @@ void waitForSlotReady(char const* flagPtr, uint64_t epoch) {
 void waitForCudaStream(cudaStream_t stream) {
   int spins = 0;
   while (true) {
+    checkDeviceAllGatherAbort();
     cudaError_t result = cudaStreamQuery(stream);
     if (result == cudaSuccess) return;
     if (result != cudaErrorNotReady) MSCCLPP_CUDATHROW(result);
@@ -518,6 +545,7 @@ void waitForCudaStream(cudaStream_t stream) {
 void waitForCudaEvent(cudaEvent_t event) {
   int spins = 0;
   while (true) {
+    checkDeviceAllGatherAbort();
     cudaError_t result = cudaEventQuery(event);
     if (result == cudaSuccess) return;
     if (result != cudaErrorNotReady) MSCCLPP_CUDATHROW(result);
@@ -598,6 +626,7 @@ size_t pipeReadyOffset(int nodeId) {
 void pollQp(AgContext& ctx) {
   if (!ctx.smallQp) return;
   while (ctx.smallQp->getNumSendCqItems() > 0) {
+    checkDeviceAllGatherAbort();
     int wcNum = ctx.smallQp->pollSendCq();
     if (wcNum < 0) {
       throw mscclpp::Error("small allgather pollSendCq failed",
@@ -1412,6 +1441,24 @@ ncclResult_t copyGroupChunkToOutput(
   return ncclSuccess;
 }
 
+void waitForGroupInput(AgContext& ctx, int rank, uint64_t epoch) {
+  if (!activeDeviceCall) return ctx.exchBuf->waitCpu(rank, epoch);
+  int spins = 0;
+  for (;;) {
+    checkDeviceAllGatherAbort();
+    uint64_t value = __atomic_load_n(&ctx.exchBuf->control()->d2hReady[rank], __ATOMIC_ACQUIRE);
+    if (value == UINT64_MAX)
+      throw mscclpp::Error("device AllGather peer failed", mscclpp::ErrorCode::SystemError);
+    if (value >= epoch) break;
+    if (spins++ < kPollSpinsBeforeYield) {
+      asm volatile("pause" ::: "memory");
+    } else {
+      std::this_thread::yield();
+    }
+  }
+  std::atomic_thread_fence(std::memory_order_acquire);
+}
+
 ncclResult_t exchangeGroupChunk(AgContext& ctx,
                                 void const* sendbuff, void* recvbuff,
                                 size_t bytesPerRank, size_t chunkOffset,
@@ -1494,7 +1541,7 @@ ncclResult_t exchangeGroupChunk(AgContext& ctx,
 
   if (ctx.isLeader) {
     for (int i = 0; i < ctx.groupSize; ++i) {
-      ctx.exchBuf->waitCpu(ctx.groupBase + i, epoch);
+      waitForGroupInput(ctx, ctx.groupBase + i, epoch);
     }
 
     ctx.ctrl->rdmaSignal[ctx.nodeId].store(epoch,
@@ -1532,6 +1579,15 @@ ncclResult_t exchangeGroupChunk(AgContext& ctx,
   }
 
   if (copyAsSoonAsReady) {
+    // Device-service calls use independent DMA streams while the caller CTA
+    // waits. Before reading local peers' sendSlab, their consumers must observe
+    // local D2H completion as well as remote RDMA readiness. Keep this additional
+    // wait exclusive to GPU-driven calls; native host dispatch is unchanged.
+    if (activeDeviceCall && !ctx.isLeader) {
+      for (int i = 0; i < ctx.groupSize; ++i) {
+        waitForGroupInput(ctx, ctx.groupBase + i, epoch);
+      }
+    }
     bool oneRankDirectCopy =
         oneRankLayout &&
         (oneRankInPlace || chunkBytes >= kOneRankDirectCopyCutoffBytes);
@@ -1713,29 +1769,9 @@ ncclResult_t runOneRankChunkPipeline(
   return ncclSuccess;
 }
 
-ncclResult_t runSingleSlab(
-    void const* sendbuff, void* recvbuff, size_t sendcount,
-    size_t bytesPerRank, ncclDataType_t datatype, ncclComm_t comm,
-    cudaStream_t stream, int rank, int nRanks, int nRanksPerNode,
-    std::shared_ptr<Communicator> bootstrapComm, int cudaDevice) {
-  if (!isMultiNodeLayout(nRanks, nRanksPerNode)) return ncclInvalidUsage;
-  if (nRanksPerNode <= 0 || nRanksPerNode > kMaxRanksPerNode) {
-    return ncclInvalidUsage;
-  }
-  size_t typeSize = ncclTypeSize(datatype);
-  if (typeSize == 0) return ncclInvalidArgument;
-  if (sendcount > std::numeric_limits<size_t>::max() / typeSize) {
-    return ncclInvalidArgument;
-  }
-  if (sendcount * typeSize != bytesPerRank) {
-    return ncclInvalidUsage;
-  }
-  if (bytesPerRank == 0) return ncclSuccess;
-
-  try {
-    mscclpp::CudaDeviceGuard deviceGuard(cudaDevice);
-    auto& ctx = getSingleContext(
-        comm, bootstrapComm, rank, nRanks, nRanksPerNode, cudaDevice);
+ncclResult_t executeSingleSlabSchedule(AgContext& ctx, void const* sendbuff, void* recvbuff, size_t bytesPerRank, cudaStream_t stream, std::shared_ptr<Communicator> bootstrapComm) {
+  int rank = ctx.rank;
+  int nRanksPerNode = ctx.nRanksPerNode;
     ensurePipelineStreams(ctx);
     MSCCLPP_CUDATHROW(cudaEventRecord(ctx.inputReadyEvent, stream));
     MSCCLPP_CUDATHROW(cudaStreamWaitEvent(ctx.d2hStream,
@@ -1785,6 +1821,32 @@ ncclResult_t runSingleSlab(
     MSCCLPP_CUDATHROW(cudaEventRecord(ctx.h2dDoneEvent, ctx.h2dStream));
     MSCCLPP_CUDATHROW(cudaStreamWaitEvent(stream, ctx.h2dDoneEvent, 0));
     return ncclSuccess;
+}
+
+ncclResult_t runSingleSlab(
+    void const* sendbuff, void* recvbuff, size_t sendcount,
+    size_t bytesPerRank, ncclDataType_t datatype, ncclComm_t comm,
+    cudaStream_t stream, int rank, int nRanks, int nRanksPerNode,
+    std::shared_ptr<Communicator> bootstrapComm, int cudaDevice) {
+  if (!isMultiNodeLayout(nRanks, nRanksPerNode)) return ncclInvalidUsage;
+  if (nRanksPerNode <= 0 || nRanksPerNode > kMaxRanksPerNode) {
+    return ncclInvalidUsage;
+  }
+  size_t typeSize = ncclTypeSize(datatype);
+  if (typeSize == 0) return ncclInvalidArgument;
+  if (sendcount > std::numeric_limits<size_t>::max() / typeSize) {
+    return ncclInvalidArgument;
+  }
+  if (sendcount * typeSize != bytesPerRank) {
+    return ncclInvalidUsage;
+  }
+  if (bytesPerRank == 0) return ncclSuccess;
+
+  try {
+    mscclpp::CudaDeviceGuard deviceGuard(cudaDevice);
+    auto& ctx = getSingleContext(
+        comm, bootstrapComm, rank, nRanks, nRanksPerNode, cudaDevice);
+    return executeSingleSlabSchedule(ctx, sendbuff, recvbuff, bytesPerRank, stream, bootstrapComm);
   } catch (std::exception const& ex) {
     WARN("AllGather failed: %s", ex.what());
     return mapException(ex);
@@ -1825,33 +1887,9 @@ ncclResult_t copySmallFallbackOutput(AgContext& ctx,
   return ncclSuccess;
 }
 
-ncclResult_t runSmallFallback(
-    void const* sendbuff, void* recvbuff, size_t sendcount,
-    size_t bytesPerRank, ncclDataType_t datatype, ncclComm_t comm,
-    cudaStream_t stream, int rank, int nRanks, int nRanksPerNode,
-    std::shared_ptr<Communicator> bootstrapComm, int cudaDevice) {
-  if (!isTwoNodeLayout(nRanks, nRanksPerNode)) return ncclInvalidUsage;
-  if (nRanksPerNode <= 0 || nRanksPerNode > kMaxRanksPerNode) {
-    return ncclInvalidUsage;
-  }
-  size_t typeSize = ncclTypeSize(datatype);
-  if (typeSize == 0) return ncclInvalidArgument;
-  if (sendcount > std::numeric_limits<size_t>::max() / typeSize) {
-    return ncclInvalidArgument;
-  }
-  if (sendcount * typeSize != bytesPerRank) return ncclInvalidUsage;
-  if (bytesPerRank == 0) return ncclSuccess;
-  if (bytesPerRank >
-      std::numeric_limits<size_t>::max() / static_cast<size_t>(nRanks)) {
-    return ncclInvalidUsage;
-  }
-  size_t fullBytes = bytesPerRank * static_cast<size_t>(nRanks);
-  if (fullBytes >= smallCutoffBytes(nRanksPerNode)) return ncclInvalidUsage;
-
-  try {
-    mscclpp::CudaDeviceGuard deviceGuard(cudaDevice);
-    auto& ctx = getSingleContext(
-        comm, bootstrapComm, rank, nRanks, nRanksPerNode, cudaDevice);
+ncclResult_t executeSmallFallbackSchedule(AgContext& ctx, void const* sendbuff, void* recvbuff, size_t bytesPerRank, cudaStream_t stream) {
+  int nRanksPerNode = ctx.nRanksPerNode;
+  size_t fullBytes = bytesPerRank * ctx.worldSize;
     size_t blockBytes = static_cast<size_t>(ctx.groupSize) * bytesPerRank;
     size_t scratchBytes = static_cast<size_t>(ctx.groupSize) * fullBytes;
     if (blockBytes + scratchBytes > ctx.slabBytes) return ncclInvalidUsage;
@@ -1904,6 +1942,36 @@ ncclResult_t runSmallFallback(
     }
     waitForEpoch(ctx.ctrl->ackReady[1 - ctx.nodeId], epoch);
     return ncclSuccess;
+}
+
+ncclResult_t runSmallFallback(
+    void const* sendbuff, void* recvbuff, size_t sendcount,
+    size_t bytesPerRank, ncclDataType_t datatype, ncclComm_t comm,
+    cudaStream_t stream, int rank, int nRanks, int nRanksPerNode,
+    std::shared_ptr<Communicator> bootstrapComm, int cudaDevice) {
+  if (!isTwoNodeLayout(nRanks, nRanksPerNode)) return ncclInvalidUsage;
+  if (nRanksPerNode <= 0 || nRanksPerNode > kMaxRanksPerNode) {
+    return ncclInvalidUsage;
+  }
+  size_t typeSize = ncclTypeSize(datatype);
+  if (typeSize == 0) return ncclInvalidArgument;
+  if (sendcount > std::numeric_limits<size_t>::max() / typeSize) {
+    return ncclInvalidArgument;
+  }
+  if (sendcount * typeSize != bytesPerRank) return ncclInvalidUsage;
+  if (bytesPerRank == 0) return ncclSuccess;
+  if (bytesPerRank >
+      std::numeric_limits<size_t>::max() / static_cast<size_t>(nRanks)) {
+    return ncclInvalidUsage;
+  }
+  size_t fullBytes = bytesPerRank * static_cast<size_t>(nRanks);
+  if (fullBytes >= smallCutoffBytes(nRanksPerNode)) return ncclInvalidUsage;
+
+  try {
+    mscclpp::CudaDeviceGuard deviceGuard(cudaDevice);
+    auto& ctx = getSingleContext(
+        comm, bootstrapComm, rank, nRanks, nRanksPerNode, cudaDevice);
+    return executeSmallFallbackSchedule(ctx, sendbuff, recvbuff, bytesPerRank, stream);
   } catch (std::exception const& ex) {
     WARN("small fallback AllGather failed: %s", ex.what());
     return mapException(ex);
@@ -1972,47 +2040,23 @@ ncclResult_t runOneRankGpuDirect(
   }
 }
 
-ncclResult_t runSmallOrdered(
-    void const* sendbuff, void* recvbuff, size_t sendcount,
-    size_t bytesPerRank, ncclDataType_t datatype, ncclComm_t comm,
-    cudaStream_t stream, int rank, int nRanks, int nRanksPerNode,
-    std::shared_ptr<Communicator> bootstrapComm, int cudaDevice) {
-  if (!isTwoNodeLayout(nRanks, nRanksPerNode)) return ncclInvalidUsage;
-  if (nRanksPerNode <= 0 || nRanksPerNode > kMaxRanksPerNode) {
-    return ncclInvalidUsage;
-  }
-  size_t typeSize = ncclTypeSize(datatype);
-  if (typeSize == 0) return ncclInvalidArgument;
-  if (sendcount > std::numeric_limits<size_t>::max() / typeSize) {
-    return ncclInvalidArgument;
-  }
-  if (sendcount * typeSize != bytesPerRank) return ncclInvalidUsage;
-  if (bytesPerRank == 0) return ncclSuccess;
-  if (bytesPerRank >
-      std::numeric_limits<size_t>::max() / static_cast<size_t>(nRanks)) {
-    return ncclInvalidUsage;
-  }
-  size_t fullBytes = bytesPerRank * static_cast<size_t>(nRanks);
-  if (fullBytes >= smallCutoffBytes(nRanksPerNode)) return ncclInvalidUsage;
-
-  try {
-    mscclpp::CudaDeviceGuard deviceGuard(cudaDevice);
-    auto& ctx = getSingleContext(
-        comm, bootstrapComm, rank, nRanks, nRanksPerNode, cudaDevice);
+ncclResult_t executeOrderedSmallSchedule(AgContext& ctx, void const* sendbuff, void* recvbuff, size_t bytesPerRank, cudaStream_t stream, std::shared_ptr<Communicator> bootstrapComm, LiteNetworkControl* deviceCall = nullptr, uint64_t sequence = 0) {
+  int rank = ctx.rank;
+  size_t fullBytes = bytesPerRank * ctx.worldSize;
     bool useOneRankRegister =
         ctx.nodeCount == 2 && ctx.nRanksPerNode == 1 &&
         fullBytes < kOneRankMappedOutputCutoffBytes &&
-        ctx.sendDeviceSlab != nullptr && ctx.ctrlDeviceSlab != nullptr;
+        ctx.sendDeviceSlab != nullptr && (!deviceCall || deviceCall->mapped) && ctx.ctrlDeviceSlab != nullptr;
     bool useTwoRankRecvKernel =
         ctx.nodeCount == 2 && ctx.nRanksPerNode == 2 &&
-        fullBytes <= 4 * 1024 && ctx.sendDeviceSlab != nullptr;
+        fullBytes <= 4 * 1024 && ctx.sendDeviceSlab != nullptr && (!deviceCall || deviceCall->mapped);
     bool useTwoRankRegisterPack =
         ctx.nodeCount == 2 && ctx.nRanksPerNode == 2 &&
         fullBytes >= 512 && fullBytes <= 4 * 1024 &&
-        ctx.sendDeviceSlab != nullptr && ctx.ctrlDeviceSlab != nullptr;
+        ctx.sendDeviceSlab != nullptr && (!deviceCall || deviceCall->mapped) && ctx.ctrlDeviceSlab != nullptr;
     bool useTwoRankTinyPack =
         ctx.nodeCount == 2 && ctx.nRanksPerNode == 2 &&
-        fullBytes <= 256 && ctx.sendDeviceSlab != nullptr &&
+        fullBytes <= 256 && ctx.sendDeviceSlab != nullptr && (!deviceCall || deviceCall->mapped) &&
         ctx.ctrlDeviceSlab != nullptr;
     bool useTwoRankGpuPack =
         useTwoRankTinyPack || useTwoRankRegisterPack;
@@ -2053,30 +2097,57 @@ ncclResult_t runSmallOrdered(
     bool oneRankInPlace =
         isOneRankPerNodeInPlace(ctx, sendbuff, recvbuff, bytesPerRank,
                                 /*chunkOffset=*/0);
+    if (deviceCall) {
+      deviceCall->epoch = epoch;
+      deviceCall->slab = const_cast<char*>(ctx.sendDeviceSlab);
+      deviceCall->control = ctx.ctrlDeviceSlab;
+      deviceCall->slotOffset = slotOffset;
+      deviceCall->flagOffset = flagOffset;
+      deviceCall->segmentBytes = compactSegmentBytes;
+      deviceCall->flagInSegment = compactFlagOffset;
+      deviceCall->readyOffset = d2hReadyOffset(ctx.localRank);
+      deviceCall->readyBase = offsetof(HostControl, d2hReady);
+      deviceCall->readyStride = sizeof(std::atomic<uint64_t>);
+      deviceCall->localGroupSize = ctx.groupSize;
+      deviceCall->oneRankRegister = useOneRankRegister;
+      deviceCall->stageWithSm = useOneRankRegister || useTwoRankGpuPack;
+      deviceCall->receiveWithSm = useOneRankRegister || useTwoRankRecvKernel;
+      // Clear before publication. The GPU may publish ready immediately.
+      if (useOneRankRegister)
+        ctx.ctrl->d2hReady[ctx.localRank].store(0, std::memory_order_release);
+      __atomic_store_n(&deviceCall->prepared, sequence, __ATOMIC_RELEASE);
+    }
     if (useOneRankRegister) {
-      ctx.ctrl->d2hReady[ctx.localRank].store(0, std::memory_order_release);
+      if (!deviceCall)
+        ctx.ctrl->d2hReady[ctx.localRank].store(0, std::memory_order_release);
       bool useTinyOriginal = fullBytes == 128;
       bool useParallelOriginal = fullBytes == 256;
       if (useTinyOriginal) {
+        if (!deviceCall) {
         oneRankTinyRegisterCopyKernel<<<1, 1, 0, stream>>>(
             send, static_cast<char*>(recvbuff),
             const_cast<char*>(ctx.sendDeviceSlab), ctx.ctrlDeviceSlab,
             slotOffset, flagOffset, bytesPerRank, rank, !oneRankInPlace,
             d2hReadyOffset(ctx.localRank), epoch);
+        }
       } else if (useParallelOriginal) {
+        if (!deviceCall) {
         oneRankRegisterCopyKernel<<<1, 128, 0, stream>>>(
             send, static_cast<char*>(recvbuff),
             const_cast<char*>(ctx.sendDeviceSlab), ctx.ctrlDeviceSlab,
             slotOffset, flagOffset, bytesPerRank, rank, !oneRankInPlace,
             d2hReadyOffset(ctx.localRank), epoch);
+        }
       } else {
         int blockThreads =
             (fullBytes == 16 * 1024 || fullBytes == 32 * 1024) ? 256 : 128;
+        if (!deviceCall) {
         oneRankCompactRegisterCopyKernel<<<1, blockThreads, 0, stream>>>(
             send, static_cast<char*>(recvbuff),
             const_cast<char*>(ctx.sendDeviceSlab), ctx.ctrlDeviceSlab,
             slotOffset, compactSegmentBytes, compactFlagOffset, bytesPerRank,
             rank, !oneRankInPlace, d2hReadyOffset(ctx.localRank), epoch);
+        }
       }
       MSCCLPP_CUDATHROW(cudaGetLastError());
       waitForEpoch(ctx.ctrl->d2hReady[ctx.localRank], epoch);
@@ -2098,16 +2169,20 @@ ncclResult_t runSmallOrdered(
       return ncclSuccess;
     }
     if (useTwoRankTinyPack) {
+      if (!deviceCall) {
       multiRankTinyPackKernel<<<1, 1, 0, stream>>>(
           send, const_cast<char*>(ctx.sendDeviceSlab), ctx.ctrlDeviceSlab,
           slotOffset, static_cast<size_t>(rank) * bytesPerRank, bytesPerRank,
           d2hReadyOffset(ctx.localRank), epoch);
+      }
       MSCCLPP_CUDATHROW(cudaGetLastError());
     } else if (useTwoRankRegisterPack) {
+      if (!deviceCall) {
       multiRankRegisterPackKernel<<<1, 128, 0, stream>>>(
           send, const_cast<char*>(ctx.sendDeviceSlab), ctx.ctrlDeviceSlab,
           slotOffset, static_cast<size_t>(rank) * bytesPerRank, bytesPerRank,
           d2hReadyOffset(ctx.localRank), epoch);
+      }
       MSCCLPP_CUDATHROW(cudaGetLastError());
     } else {
       mscclpp::lite::CpuSwitch<char>{}
@@ -2123,10 +2198,12 @@ ncclResult_t runSmallOrdered(
         ensurePipelineStreams(ctx);
         MSCCLPP_CUDATHROW(cudaEventRecord(ctx.inputReadyEvent, stream));
       }
+      if (!deviceCall) {
       multiRankHostRecvKernel<<<1, 128, 0, stream>>>(
           static_cast<char*>(recvbuff), ctx.sendDeviceSlab, ctx.ctrlDeviceSlab,
           offsetof(HostControl, d2hReady), ctx.groupSize, slotOffset,
           flagOffset, fullBytes, epoch);
+      }
       MSCCLPP_CUDATHROW(cudaGetLastError());
       if (!useTwoRankGpuPack) {
         waitForCudaEvent(ctx.inputReadyEvent);
@@ -2198,27 +2275,15 @@ ncclResult_t runSmallOrdered(
               {ctx.sendSlab + slotOffset, fullBytes}, {recv, fullBytes}, stream);
     }
     return ncclSuccess;
-  } catch (std::exception const& ex) {
-    WARN("small ordered AllGather failed: %s", ex.what());
-    return mapException(ex);
-  } catch (...) {
-    WARN("small ordered AllGather failed with an unknown exception");
-    return ncclInternalError;
-  }
 }
 
-ncclResult_t runNumaSplit(
+ncclResult_t runSmallOrdered(
     void const* sendbuff, void* recvbuff, size_t sendcount,
     size_t bytesPerRank, ncclDataType_t datatype, ncclComm_t comm,
     cudaStream_t stream, int rank, int nRanks, int nRanksPerNode,
     std::shared_ptr<Communicator> bootstrapComm, int cudaDevice) {
-  if (!isMultiNodeLayout(nRanks, nRanksPerNode)) return ncclInvalidUsage;
+  if (!isTwoNodeLayout(nRanks, nRanksPerNode)) return ncclInvalidUsage;
   if (nRanksPerNode <= 0 || nRanksPerNode > kMaxRanksPerNode) {
-    return ncclInvalidUsage;
-  }
-  auto layout = getNicGroupLayout(comm, bootstrapComm, rank, nRanks,
-                                  nRanksPerNode, cudaDevice);
-  if (layout.count <= 1) {
     return ncclInvalidUsage;
   }
   size_t typeSize = ncclTypeSize(datatype);
@@ -2228,16 +2293,30 @@ ncclResult_t runNumaSplit(
   }
   if (sendcount * typeSize != bytesPerRank) return ncclInvalidUsage;
   if (bytesPerRank == 0) return ncclSuccess;
+  if (bytesPerRank >
+      std::numeric_limits<size_t>::max() / static_cast<size_t>(nRanks)) {
+    return ncclInvalidUsage;
+  }
+  size_t fullBytes = bytesPerRank * static_cast<size_t>(nRanks);
+  if (fullBytes >= smallCutoffBytes(nRanksPerNode)) return ncclInvalidUsage;
 
   try {
     mscclpp::CudaDeviceGuard deviceGuard(cudaDevice);
-    std::vector<AgContext*> groups(layout.count);
-    for (int groupId = 0; groupId < layout.count; ++groupId) {
-      groups[groupId] = &getNumaContext(
-          comm, bootstrapComm, rank, nRanks, nRanksPerNode, cudaDevice,
-          groupId);
-    }
+    auto& ctx = getSingleContext(
+        comm, bootstrapComm, rank, nRanks, nRanksPerNode, cudaDevice);
+    return executeOrderedSmallSchedule(ctx, sendbuff, recvbuff, bytesPerRank, stream, bootstrapComm);
+  } catch (std::exception const& ex) {
+    WARN("small ordered AllGather failed: %s", ex.what());
+    return mapException(ex);
+  } catch (...) {
+    WARN("small ordered AllGather failed with an unknown exception");
+    return ncclInternalError;
+  }
+}
 
+ncclResult_t executeNumaSchedule(std::vector<AgContext*> const& groups, NicGroupLayout const& layout, void const* sendbuff, void* recvbuff, size_t bytesPerRank, cudaStream_t stream, std::shared_ptr<Communicator> bootstrapComm) {
+  int rank = groups[0]->rank;
+  int nRanksPerNode = groups[0]->nRanksPerNode;
     int localRank = rank % nRanksPerNode;
     int ownGroupId = groupForLocalRank(layout, localRank);
     AgContext& own = *groups[ownGroupId];
@@ -2408,6 +2487,40 @@ ncclResult_t runNumaSplit(
     MSCCLPP_CUDATHROW(cudaEventRecord(own.h2dDoneEvent, own.h2dStream));
     MSCCLPP_CUDATHROW(cudaStreamWaitEvent(stream, own.h2dDoneEvent, 0));
     return ncclSuccess;
+}
+
+ncclResult_t runNumaSplit(
+    void const* sendbuff, void* recvbuff, size_t sendcount,
+    size_t bytesPerRank, ncclDataType_t datatype, ncclComm_t comm,
+    cudaStream_t stream, int rank, int nRanks, int nRanksPerNode,
+    std::shared_ptr<Communicator> bootstrapComm, int cudaDevice) {
+  if (!isMultiNodeLayout(nRanks, nRanksPerNode)) return ncclInvalidUsage;
+  if (nRanksPerNode <= 0 || nRanksPerNode > kMaxRanksPerNode) {
+    return ncclInvalidUsage;
+  }
+  auto layout = getNicGroupLayout(comm, bootstrapComm, rank, nRanks,
+                                  nRanksPerNode, cudaDevice);
+  if (layout.count <= 1) {
+    return ncclInvalidUsage;
+  }
+  size_t typeSize = ncclTypeSize(datatype);
+  if (typeSize == 0) return ncclInvalidArgument;
+  if (sendcount > std::numeric_limits<size_t>::max() / typeSize) {
+    return ncclInvalidArgument;
+  }
+  if (sendcount * typeSize != bytesPerRank) return ncclInvalidUsage;
+  if (bytesPerRank == 0) return ncclSuccess;
+
+  try {
+    mscclpp::CudaDeviceGuard deviceGuard(cudaDevice);
+    std::vector<AgContext*> groups(layout.count);
+    for (int groupId = 0; groupId < layout.count; ++groupId) {
+      groups[groupId] = &getNumaContext(
+          comm, bootstrapComm, rank, nRanks, nRanksPerNode, cudaDevice,
+          groupId);
+    }
+
+    return executeNumaSchedule(groups, layout, sendbuff, recvbuff, bytesPerRank, stream, bootstrapComm);
   } catch (std::exception const& ex) {
     WARN("NUMA AllGather failed: %s", ex.what());
     return mapException(ex);
@@ -2417,8 +2530,147 @@ ncclResult_t runNumaSplit(
   }
 }
 
+// Dedicated ownership: host and device entry points share scheduling code, not
+// mutable epochs or streams. Device initialization prepares every resource.
+struct DeviceNetworkOwner {
+  std::unique_ptr<AgContext> single;
+  std::array<std::unique_ptr<AgContext>, kMaxNicGroups> ownedGroups;
+  std::vector<AgContext*> groups;
+  NicGroupLayout layout{};
+  std::shared_ptr<Communicator> bootstrap;
+  size_t capacity = 0;
+  bool mapped = false;
+};
+
 }  // namespace
 
+
+void* prepareDeviceAllGatherNetwork(ncclComm_t comm,
+    std::shared_ptr<Communicator> bootstrap, int rank, int nranks,
+    int ranksPerNode, int cudaDevice, size_t capacity, int* groupCount) {
+  auto owner = std::make_unique<DeviceNetworkOwner>();
+  owner->bootstrap = bootstrap;
+  owner->capacity = capacity;
+  // Only a namespace nonce; getContext never dereferences this handle.
+  auto key = reinterpret_cast<ncclComm_t>(owner.get());
+  getContext([&]() -> std::unique_ptr<AgContext>& { return owner->single; },
+      key, bootstrap, rank, nranks, ranksPerNode, cudaDevice,
+      0, 0, ranksPerNode, cudaDevice, false, "device AllGather");
+  std::vector<int> mappings(nranks);
+  mappings[rank] = owner->single->sendDeviceSlab && owner->single->ctrlDeviceSlab;
+  bootstrap->bootstrap()->allGather(mappings.data(), sizeof(int));
+  owner->mapped = std::all_of(mappings.begin(), mappings.end(), [](int value) { return value != 0; });
+  owner->layout = getNicGroupLayout(comm, bootstrap, rank, nranks,
+                                    ranksPerNode, cudaDevice);
+  if (ranksPerNode > 2 && owner->layout.count > 1) {
+    for (int g = 0; g < owner->layout.count; ++g) {
+      auto& ctx = getContext(
+          [&]() -> std::unique_ptr<AgContext>& { return owner->ownedGroups[g]; },
+          key, bootstrap, rank, nranks, ranksPerNode, cudaDevice, g,
+          owner->layout.base[g], owner->layout.size[g],
+          owner->layout.transportDevice[g], true, "device NUMA AllGather");
+      owner->groups.push_back(&ctx);
+    }
+  }
+  ncclResult_t result = ncclSuccess;
+  std::string message;
+  try {
+    ensurePipelineStreams(*owner->single);
+    // Bounds cover every selected generic/full-message slot count. Calls to
+    // ensure* in shared schedules are now no-ops, including after size changes.
+    ensureSlotEvents(*owner->single, 1024);
+    if (ranksPerNode == 1) {
+      size_t bytes = std::min(capacity, kOneRankPipelineMaxBytes);
+      ensureD2hChunkEvents(*owner->single,
+          (bytes + kOneRankPipelineChunkBytes - 1) / kOneRankPipelineChunkBytes);
+    }
+    for (auto* group : owner->groups) {
+      ensurePipelineStreams(*group);
+      ensureSlotEvents(*group, 1024);
+    }
+  } catch (std::exception const& e) {
+    result = mapException(e);
+    message = e.what();
+  }
+  publishInitStatus(bootstrap, rank, nranks, result, message,
+                    "device AllGather streams/events");
+  *groupCount = owner->groups.empty() ? 1 : static_cast<int>(owner->groups.size());
+  return owner.release();
+}
+
+void executeDeviceAllGatherNetwork(void* opaque, LiteTask const& task,
+    uint64_t sequence, LiteNetworkControl* control, cudaStream_t stream) {
+  auto& owner = *static_cast<DeviceNetworkOwner*>(opaque);
+  struct WaitScope {
+    LiteNetworkControl* previous;
+    explicit WaitScope(LiteNetworkControl* call) : previous(activeDeviceCall) {
+      activeDeviceCall = call;
+    }
+    ~WaitScope() { activeDeviceCall = previous; }
+  } scope(control);
+  checkDeviceAllGatherAbort();
+  control->mapped = owner.mapped;
+  if (!task.source || !task.destination || !task.bytes || task.bytes > owner.capacity)
+    throw mscclpp::Error("invalid device network AllGather", mscclpp::ErrorCode::InvalidUsage);
+  auto const* src = reinterpret_cast<void const*>(task.source);
+  auto* dst = reinterpret_cast<void*>(task.destination);
+  auto& ctx = *owner.single;
+  ncclResult_t result = ncclInvalidUsage;
+  switch (task.networkPath) {
+    case LiteDeviceAllGatherPath::OrderedSmall:
+      result = executeOrderedSmallSchedule(ctx, src, dst, task.bytes, stream,
+                                            owner.bootstrap, control, sequence);
+      if ((result == ncclInvalidUsage || result == ncclInvalidArgument) &&
+          __atomic_load_n(&control->prepared, __ATOMIC_ACQUIRE) < sequence) {
+        control->oneRankRegister = control->stageWithSm = control->receiveWithSm = false;
+        __atomic_store_n(&control->prepared, sequence, __ATOMIC_RELEASE);
+        result = executeSmallFallbackSchedule(ctx, src, dst, task.bytes, stream);
+      }
+      break;
+    case LiteDeviceAllGatherPath::SmallFallback:
+      result = executeSmallFallbackSchedule(ctx, src, dst, task.bytes, stream);
+      break;
+    case LiteDeviceAllGatherPath::OneRankPipeline:
+    case LiteDeviceAllGatherPath::SingleSlab:
+      result = executeSingleSlabSchedule(ctx, src, dst, task.bytes, stream,
+                                          owner.bootstrap);
+      break;
+    case LiteDeviceAllGatherPath::NumaSplit:
+      if (!owner.groups.empty())
+        result = executeNumaSchedule(owner.groups, owner.layout, src, dst,
+                                      task.bytes, stream, owner.bootstrap);
+      break;
+    default: break;
+  }
+  if (result != ncclSuccess)
+    throw mscclpp::Error("device network AllGather schedule failed",
+                         mscclpp::ErrorCode::InvalidUsage);
+  // This stream is independent of the waiting user kernel. The shared DMA
+  // schedules join their private streams into it, exactly as for a CPU caller.
+  waitForCudaStream(stream);
+  if (task.networkPath == LiteDeviceAllGatherPath::OrderedSmall)
+    while (__atomic_load_n(&control->deviceDone, __ATOMIC_ACQUIRE) < sequence) {
+      if (__atomic_load_n(&control->abort, __ATOMIC_ACQUIRE))
+        throw mscclpp::Error("device AllGather aborted", mscclpp::ErrorCode::SystemError);
+      std::this_thread::yield();
+    }
+}
+
+void releaseDeviceAllGatherNetwork(void* opaque) {
+  std::unique_ptr<DeviceNetworkOwner> owner(static_cast<DeviceNetworkOwner*>(opaque));
+  if (!owner) return;
+  auto drain = [](AgContext& ctx) {
+    if (ctx.d2hStream) cudaStreamSynchronize(ctx.d2hStream);
+    if (ctx.h2dStream) cudaStreamSynchronize(ctx.h2dStream);
+    pollQp(ctx);
+  };
+  try {
+    drain(*owner->single);
+    for (auto* group : owner->groups) drain(*group);
+  } catch (...) {
+    // Destruction must not throw from DeviceCollectiveContext's destructor.
+  }
+}
 
 ncclResult_t runLiteAllGather(void const* sendbuff, void* recvbuff,
                               size_t sendcount, size_t bytesPerRank,
