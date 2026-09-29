@@ -31,7 +31,7 @@ OUT_DIR   := build
 REDUCESCATTER_CU_SRCS := $(filter-out ReduceScatter/single-node.cu,$(wildcard ReduceScatter/*.cu))
 LITE_COLL_DIR := $(MINT_DIR)/collective/lite
 GPU_DRIVEN_DIR := $(LITE_COLL_DIR)/gpu_driven
-CU_SRCS   := $(wildcard *.cu) $(LITE_COLL_DIR)/allgather_multinode.cu $(REDUCESCATTER_CU_SRCS)
+CU_SRCS   := $(wildcard *.cu) $(LITE_COLL_DIR)/allgather_multinode.cu $(GPU_DRIVEN_DIR)/network_service.cu $(REDUCESCATTER_CU_SRCS)
 CU_OBJS   := $(patsubst %.cu,$(OUT_DIR)/%.cu.o,$(CU_SRCS))
 
 LIB_MINT      := $(BUILD_DIR)/libmint.so
@@ -74,7 +74,8 @@ CPU_SWITCH_HEADERS := $(wildcard $(LITE_COLL_DIR)/cpu_switch/*.hpp)
 $(CU_OBJS): $(CPU_SWITCH_HEADERS)
 GPU_DRIVEN_HEADERS := $(wildcard $(GPU_DRIVEN_DIR)/*.cuh) $(wildcard $(GPU_DRIVEN_DIR)/*.hpp)
 $(OUT_DIR)/nccl.cu.o: $(LITE_COLL_DIR)/cpu_staging_channel.hpp $(LITE_COLL_DIR)/gpu_staging_channel.hpp $(LITE_COLL_DIR)/node_exchange_buffer.hpp $(GPU_DRIVEN_HEADERS)
-$(OUT_DIR)/$(LITE_COLL_DIR)/allgather_multinode.cu.o: lite_common.h $(GPU_DRIVEN_HEADERS)
+$(OUT_DIR)/$(LITE_COLL_DIR)/allgather_multinode.cu.o: lite_common.h
+$(OUT_DIR)/$(GPU_DRIVEN_DIR)/network_service.cu.o: lite_common.h $(GPU_DRIVEN_HEADERS) $(LITE_COLL_DIR)/node_exchange_buffer.hpp
 
 $(OUT_DIR)/$(LITE_COLL_DIR)/allgather_multinode.cu.o: $(LITE_COLL_DIR)/allgather_multinode.cu $(LITE_COLL_DIR)/node_exchange_buffer.hpp | $(OUT_DIR)
 	mkdir -p $(@D)

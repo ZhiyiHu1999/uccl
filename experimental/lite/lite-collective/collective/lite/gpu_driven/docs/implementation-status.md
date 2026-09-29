@@ -18,7 +18,7 @@ AllReduce and ReduceScatter implement Sum, Min and Max for arithmetic template t
 | `task_fifo.hpp` | DMA descriptors, FIFO ownership and system-scope publication |
 | `gpu_collectives.cuh` | Device handle, single-CTA collectives, staging, reduction and retirement |
 | `host_context.hpp` | Collective setup, NUMA discovery, registrations, connections, network proxies and cleanup |
-| `service.hpp` | DMA task service and invocation bridge to shared network schedules |
+| `service.hpp` | DMA task service and invocation bridge to GPU-private network schedules |
 | `network_service.hpp`, `network_protocol.hpp` | Shared-schedule host API and ordered SM-phase handshake |
 | `device_collectives_bench.cu` | Native NCCL comparison with untimed correctness preflight |
 | `benchmark.sh` | Build, MPI launch, bounded execution and benchmark report |
@@ -49,31 +49,33 @@ The benchmark registers once per allocated test output outside preflight/timing
 and unregisters before freeing it. Real CUDA compilation, DMA visibility and
 performance validation of this replacement are pending.
 
-## Multi-node transport shared with CPU-driven AllGather
+## GPU-private multi-node transport
 
 The five device entry points post `NetworkAllGather` descriptors to the service.
-The service executes the same scheduling functions used by CPU-driven entry
-points in `../allgather_multinode.cu`, with dedicated contexts prepared once.
+The service executes private scheduling functions in `network_service.cu`,
+with dedicated contexts prepared once. These were copied from the previously
+shared implementation; native CPU entry points now use their restored baseline
+implementation in `../allgather_multinode.cu`.
 It does not call `ncclAllGather`, `runLiteAllGather`, or launch kernels. Payload
 and control memory, QPs, streams, and slot/chunk events are prepared collectively
 before returning a handle. A service-owned stream replaces the CPU caller's
 input/output stream; it never waits for the calling GPU kernel to finish.
 
-- OrderedSmall shares slot sizing (up to 1024), layout changes and ring-wrap
+- OrderedSmall preserves the reference's slot sizing (up to 1024), layout changes and ring-wrap
   barriers, direct-QP ordered/compact writes and their signaled polling cadence.
   The service publishes the chosen slot/epoch and mapped addresses. The caller
   CTA performs SM packing and receiving with the reference participation counts:
   one-rank tiny/parallel/compact specializations and separate P=2 pack/receive
   counts. Mapping availability is agreed at setup; unmapped payloads use the
   ordered DMA path. Only a pre-publication eligibility failure invokes fallback.
-- SmallFallback shares D2H, node exchange, CPU repacking, full-output H2D and
+- SmallFallback preserves D2H, node exchange, CPU repacking, full-output H2D and
   final ACK scheduling.
-- OneRankPipeline shares one full-message epoch/slot, all-chunk D2H submission,
+- OneRankPipeline preserves one full-message epoch/slot, all-chunk D2H submission,
   512 KiB chunks with stable ready words, receive-paced send window of one,
   full-message D2D self-copy and event/ACK-controlled slot reuse.
-- SingleSlab shares per-chunk epochs, capacity-dependent slot counts, node/group
+- SingleSlab preserves per-chunk epochs, capacity-dependent slot counts, node/group
   H2D batches, self-copy conditions, direct/striped QP operations and ACK rules.
-- NumaSplit shares independent group epochs/slots and own-group staging, then
+- NumaSplit preserves independent group epochs/slots and own-group staging, then
   group/node ordered H2D on the owning group's stream. NUMA discovery uses the
   CPU reference implementation, including exclusion of P=2 splitting.
 
@@ -85,10 +87,10 @@ of output dependencies placed on the CPU caller's stream, not an assertion of
 identical invocation overhead or performance.
 
 The original RDMA proxy/NUMA device handles remain for reductions. Multi-node
-AllGather uses the primary FIFO and its dedicated shared-schedule owner instead
+AllGather uses the primary FIFO and its dedicated private schedule owner instead
 of their fixed two-slot protocol. No independent invocations may overlap on a
 handle. Cleanup stops the worker and drains streams/QPs before freeing context
-resources. Device timeout/abort is observed by shared CPU polling loops; a
+resources. Device timeout/abort is observed by GPU-private CPU-service polling loops; a
 failed handle must be destroyed after its user kernel completes.
 
 ## Limits and validation status
@@ -137,3 +139,14 @@ CUDA compilation and hardware validation of these changes remain required.
 
 See `validation.md` for the limits of local validation. CUDA/IB hardware results
 for this rewrite are still pending; sharing code is not a performance claim.
+
+## CPU/GPU source isolation
+
+`allgather_intranode.cu`, `allgather_multinode.cu` and `cpu_staging_channel.hpp`
+are restored byte-for-byte to commit `0a1edbea`. GPU network service has its own
+translation unit; CPU code no longer includes the GPU network bridge or calls
+its schedules. The GPU host context uses its own NUMA-option helper and
+`DeviceHostStagingBuffer`, preserving move ownership fixes without altering
+CpuStagingChannel. Low-level CpuSwitch/NodeExchangeBuffer remain shared.
+The snapshot duplicates code deliberately to isolate future GPU fixes; reference
+changes must be reviewed and ported explicitly, not assumed to propagate.

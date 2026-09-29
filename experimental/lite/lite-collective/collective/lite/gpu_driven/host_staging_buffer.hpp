@@ -1,4 +1,5 @@
-// CpuStagingChannel: CPU-initiated shared host-memory collective staging channel.
+// GPU-private host staging ownership. CPU staging retains its baseline API.
+// DeviceHostStagingBuffer: CPU-initiated shared host-memory collective staging channel.
 //
 // Encapsulates host-memory staging for intra-node collectives (AllGather etc.):
 //   - ONE shared POSIX shm slab; all ranks map the same region.
@@ -18,23 +19,24 @@
 //   signalDone(stream, slot, tag)  — slot reuse guard.
 //   waitDone(slot, peer, tag)      — CPU spin for slot reuse.
 //
-// CscDeviceHandle: raw device pointers for GPU-kernel SM-copy paths.
+// DeviceHostDeviceHandle: raw device pointers for GPU-kernel SM-copy paths.
 //
 // Pair with GpuStagingChannel (gpu_staging_channel.hpp) for the GPU-initiated
 // variant where the GPU posts D2H commands to a ring buffer and a CPU service
-// thread executes them.  Both channels share the same CscCtrl layout so that
+// thread executes them.  Both channels share the same DeviceHostCtrl layout so that
 // wait()/get()/waitDone() are interchangeable across both variants.
 
 #pragma once
 
 #include "lite_common.h"
-#include "cpu_switch/cpu_switch.hpp"
+#include "../cpu_switch/cpu_switch.hpp"
 // Note: debug.h and WARN/INFO macros provided by the including TU (nccl.cu).
 #include <atomic>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 #include <fcntl.h>
 #include <numa.h>
@@ -45,43 +47,43 @@
 #include <cuda.h>
 
 // ── Layout constants ─────────────────────────────────────────────────────────
-static constexpr int    kCscMaxRanks  = 8;
-static constexpr int    kCscMaxSlots  = 2;    // double-buffering depth
-static constexpr int    kCscMaxChunks = 1024; // max chunks per slot
+static constexpr int    kDeviceHostMaxRanks  = 8;
+static constexpr int    kDeviceHostMaxSlots  = 2;    // double-buffering depth
+static constexpr int    kDeviceHostMaxChunks = 1024; // max chunks per slot
 
 // ── Ctrl struct (POSIX shm, device-mapped) ───────────────────────────────────
-struct CscCounter { alignas(64) std::atomic<uint64_t> value{0}; };
+struct DeviceHostCounter { alignas(64) std::atomic<uint64_t> value{0}; };
 
-struct CscCtrl {
+struct DeviceHostCtrl {
   // d2hReady[slot][chunk][rank]: rank r sets after D2H of chunk c in slot s.
   // Polled by peers via cuStreamWaitValue64 before H2D.
-  CscCounter d2hReady[kCscMaxSlots][kCscMaxChunks][kCscMaxRanks];
+  DeviceHostCounter d2hReady[kDeviceHostMaxSlots][kDeviceHostMaxChunks][kDeviceHostMaxRanks];
   // slotDone[slot][rank]: rank r sets after all H2D for this slot is done.
   // CPU-polled at call entry for slot reuse guard (not hot path).
-  CscCounter slotDone[kCscMaxSlots][kCscMaxRanks];
+  DeviceHostCounter slotDone[kDeviceHostMaxSlots][kDeviceHostMaxRanks];
 };
 
 // ── Device handle (for GPU kernel paths) ─────────────────────────────────────
-struct CscDeviceHandle {
+struct DeviceHostDeviceHandle {
   char*  slabDev;       // device ptr to full slab (null if !mapSlab)
-  char*  ctrlDev;       // device ptr to CscCtrl
+  char*  ctrlDev;       // device ptr to DeviceHostCtrl
   int    rank;
   int    nRanks;
   size_t bytesPerRank;
   size_t slotStride;    // bytes between slots: = bytesPerRank * nRanks (padded)
-  size_t counterStride; // = sizeof(CscCounter)
+  size_t counterStride; // = sizeof(DeviceHostCounter)
 
   // ── Host/device offset helpers ─────────────────────────────────────────────
   __host__ __device__ size_t slotOffset(int slot) const {
     return static_cast<size_t>(slot) * slotStride;
   }
   __host__ __device__ size_t readyFlagOffset(int slot) const {
-    return sizeof(CscCounter) * (
-        static_cast<size_t>(slot) * (kCscMaxChunks * kCscMaxRanks));
+    return sizeof(DeviceHostCounter) * (
+        static_cast<size_t>(slot) * (kDeviceHostMaxChunks * kDeviceHostMaxRanks));
   }
   __host__ __device__ size_t doneFlagOffset(int slot) const {
-    return sizeof(CscCounter) * (kCscMaxSlots * kCscMaxChunks * kCscMaxRanks
-        + static_cast<size_t>(slot) * kCscMaxRanks);
+    return sizeof(DeviceHostCounter) * (kDeviceHostMaxSlots * kDeviceHostMaxChunks * kDeviceHostMaxRanks
+        + static_cast<size_t>(slot) * kDeviceHostMaxRanks);
   }
 
   // ── GPU kernel API (__device__) ────────────────────────────────────────────
@@ -101,7 +103,7 @@ struct CscDeviceHandle {
     __threadfence_system();  // ensure slab writes visible to all CPUs/GPUs
     if (threadIdx.x == 0) {
       size_t flagOff = readyFlagOffset(slot)
-          + (static_cast<size_t>(chunkId) * kCscMaxRanks
+          + (static_cast<size_t>(chunkId) * kDeviceHostMaxRanks
              + static_cast<size_t>(rank)) * counterStride;
       *reinterpret_cast<volatile unsigned long long*>(ctrlDev + flagOff) = tag;
       __threadfence_system();
@@ -113,7 +115,7 @@ struct CscDeviceHandle {
   // Call from ONE thread per peer (e.g. thread peer, if peer < blockDim.x).
   __device__ void wait(int slot, int chunkId, int peer, uint64_t tag) {
     size_t flagOff = readyFlagOffset(slot)
-        + (static_cast<size_t>(chunkId) * kCscMaxRanks
+        + (static_cast<size_t>(chunkId) * kDeviceHostMaxRanks
            + static_cast<size_t>(peer)) * counterStride;
     volatile auto* f =
         reinterpret_cast<volatile unsigned long long*>(ctrlDev + flagOff);
@@ -152,12 +154,12 @@ struct CscDeviceHandle {
   }
 };
 
-// ── CpuStagingChannel ─────────────────────────────────────────────────────────
-class CpuStagingChannel {
+// ── DeviceHostStagingBuffer ─────────────────────────────────────────────────────────
+class DeviceHostStagingBuffer {
  public:
   // Create and initialize the buffer. Called collectively — all ranks must call.
   // Throws on failure (propagated via bootstrap allGather).
-  static CpuStagingChannel create(
+  static DeviceHostStagingBuffer create(
       size_t bytesPerRank,
       int nSlots,
       std::shared_ptr<mscclpp::Communicator> bootstrapComm,
@@ -166,11 +168,11 @@ class CpuStagingChannel {
       std::string const& nameTag);  // unique per comm (e.g. comm ptr hex)
 
   // Non-copyable, moveable.
-  CpuStagingChannel(CpuStagingChannel const&) = delete;
-  CpuStagingChannel& operator=(CpuStagingChannel const&) = delete;
-  CpuStagingChannel(CpuStagingChannel&&) = default;
-  CpuStagingChannel& operator=(CpuStagingChannel&&) = default;
-  ~CpuStagingChannel();
+  DeviceHostStagingBuffer(DeviceHostStagingBuffer const&) = delete;
+  DeviceHostStagingBuffer& operator=(DeviceHostStagingBuffer const&) = delete;
+  DeviceHostStagingBuffer(DeviceHostStagingBuffer&& other) noexcept;
+  DeviceHostStagingBuffer& operator=(DeviceHostStagingBuffer&& other) noexcept;
+  ~DeviceHostStagingBuffer();
 
   // ── Stream API ─────────────────────────────────────────────────────────────
 
@@ -205,7 +207,7 @@ class CpuStagingChannel {
   void waitDone(int slot, int peer, uint64_t tag) const;
 
   // ── Device handle ──────────────────────────────────────────────────────────
-  CscDeviceHandle deviceHandle() const;
+  DeviceHostDeviceHandle deviceHandle() const;
 
   // ── Accessors ──────────────────────────────────────────────────────────────
   int    rank()        const { return rank_; }
@@ -225,10 +227,10 @@ class CpuStagingChannel {
                        + static_cast<size_t>(r) * bytesPerRank_;
   }
   char* ctrlDev() const { return ctrlDevice_; }
-  CscCtrl* ctrl()  const { return ctrl_; }
+  DeviceHostCtrl* ctrl()  const { return ctrl_; }
 
  private:
-  CpuStagingChannel() = default;
+  DeviceHostStagingBuffer() = default;
 
   // Slab
   size_t slabBytes_   = 0;
@@ -240,7 +242,7 @@ class CpuStagingChannel {
 
   // Ctrl
   void*    ctrlMapping_   = nullptr;
-  CscCtrl* ctrl_          = nullptr;
+  DeviceHostCtrl* ctrl_          = nullptr;
   char*    ctrlDevice_    = nullptr;
   bool     ctrlRegistered_ = false;
   std::string ctrlName_;
@@ -252,16 +254,37 @@ class CpuStagingChannel {
   int    nSlots_       = 0;
   bool   isLeader_     = false;
 
+  void swap_(DeviceHostStagingBuffer& other) noexcept {
+    using std::swap;
+    swap(slabBytes_, other.slabBytes_);
+    swap(slabMapping_, other.slabMapping_);
+    swap(slab_, other.slab_);
+    swap(slabDevice_, other.slabDevice_);
+    swap(slabRegistered_, other.slabRegistered_);
+    swap(slabName_, other.slabName_);
+    swap(ctrlMapping_, other.ctrlMapping_);
+    swap(ctrl_, other.ctrl_);
+    swap(ctrlDevice_, other.ctrlDevice_);
+    swap(ctrlRegistered_, other.ctrlRegistered_);
+    swap(ctrlName_, other.ctrlName_);
+    swap(rank_, other.rank_);
+    swap(nRanks_, other.nRanks_);
+    swap(bytesPerRank_, other.bytesPerRank_);
+    swap(slotStride_, other.slotStride_);
+    swap(nSlots_, other.nSlots_);
+    swap(isLeader_, other.isLeader_);
+  }
+
   // Internal helpers
   static CUdeviceptr readyFlagCuAddr_(char const* ctrlDev, int slot, int chunk, int rank) {
-    size_t off = sizeof(CscCounter) * (
-        (static_cast<size_t>(slot) * kCscMaxChunks + static_cast<size_t>(chunk))
-        * kCscMaxRanks + static_cast<size_t>(rank));
+    size_t off = sizeof(DeviceHostCounter) * (
+        (static_cast<size_t>(slot) * kDeviceHostMaxChunks + static_cast<size_t>(chunk))
+        * kDeviceHostMaxRanks + static_cast<size_t>(rank));
     return reinterpret_cast<CUdeviceptr>(ctrlDev + off);
   }
   static CUdeviceptr doneFlagCuAddr_(char const* ctrlDev, int slot, int rank) {
-    size_t off = sizeof(CscCounter) * (kCscMaxSlots * kCscMaxChunks * kCscMaxRanks
-        + static_cast<size_t>(slot) * kCscMaxRanks + static_cast<size_t>(rank));
+    size_t off = sizeof(DeviceHostCounter) * (kDeviceHostMaxSlots * kDeviceHostMaxChunks * kDeviceHostMaxRanks
+        + static_cast<size_t>(slot) * kDeviceHostMaxRanks + static_cast<size_t>(rank));
     return reinterpret_cast<CUdeviceptr>(ctrlDev + off);
   }
 
@@ -270,7 +293,7 @@ class CpuStagingChannel {
                                       static_cast<cuuint64_t>(val),
                                       CU_STREAM_WRITE_VALUE_DEFAULT);
     if (r != CUDA_SUCCESS)
-      throw mscclpp::Error("cuStreamWriteValue64 failed in CpuStagingChannel",
+      throw mscclpp::Error("cuStreamWriteValue64 failed in DeviceHostStagingBuffer",
                            mscclpp::ErrorCode::SystemError);
   }
   static void streamWait64_(cudaStream_t s, CUdeviceptr addr, uint64_t val) {
@@ -278,14 +301,28 @@ class CpuStagingChannel {
                                      static_cast<cuuint64_t>(val),
                                      CU_STREAM_WAIT_VALUE_GEQ);
     if (r != CUDA_SUCCESS)
-      throw mscclpp::Error("cuStreamWaitValue64 failed in CpuStagingChannel",
+      throw mscclpp::Error("cuStreamWaitValue64 failed in DeviceHostStagingBuffer",
                            mscclpp::ErrorCode::SystemError);
   }
 };
 
 // ── Inline method implementations ────────────────────────────────────────────
 
-inline void CpuStagingChannel::put(cudaStream_t stream,
+inline DeviceHostStagingBuffer::DeviceHostStagingBuffer(
+    DeviceHostStagingBuffer&& other) noexcept {
+  swap_(other);
+}
+
+inline DeviceHostStagingBuffer& DeviceHostStagingBuffer::operator=(
+    DeviceHostStagingBuffer&& other) noexcept {
+  if (this != &other) {
+    DeviceHostStagingBuffer replacement(std::move(other));
+    swap_(replacement);
+  }
+  return *this;
+}
+
+inline void DeviceHostStagingBuffer::put(cudaStream_t stream,
                                    int slot, int chunkId,
                                    void const* devSrc, size_t offset, size_t size,
                                    uint64_t tag) const {
@@ -300,13 +337,13 @@ inline void CpuStagingChannel::put(cudaStream_t stream,
   streamWrite64_(stream, readyFlagCuAddr_(ctrlDevice_, slot, chunkId, rank_), tag);
 }
 
-inline void CpuStagingChannel::wait(cudaStream_t stream,
+inline void DeviceHostStagingBuffer::wait(cudaStream_t stream,
                                     int slot, int chunkId, int peer,
                                     uint64_t tag) const {
   streamWait64_(stream, readyFlagCuAddr_(ctrlDevice_, slot, chunkId, peer), tag);
 }
 
-inline void CpuStagingChannel::get(cudaStream_t stream,
+inline void DeviceHostStagingBuffer::get(cudaStream_t stream,
                                    int slot, int firstRank, int lastRank,
                                    size_t offset, size_t size,
                                    void* devDst) const {
@@ -335,12 +372,12 @@ inline void CpuStagingChannel::get(cudaStream_t stream,
   }
 }
 
-inline void CpuStagingChannel::signalDone(cudaStream_t stream,
+inline void DeviceHostStagingBuffer::signalDone(cudaStream_t stream,
                                           int slot, uint64_t tag) const {
   streamWrite64_(stream, doneFlagCuAddr_(ctrlDevice_, slot, rank_), tag);
 }
 
-inline void CpuStagingChannel::waitDone(int slot, int peer, uint64_t tag) const {
+inline void DeviceHostStagingBuffer::waitDone(int slot, int peer, uint64_t tag) const {
   auto const& counter = ctrl_->slotDone[slot][peer];
   int spins = 0;
   constexpr int kYieldAfter = 65536;
@@ -357,22 +394,22 @@ inline void CpuStagingChannel::waitDone(int slot, int peer, uint64_t tag) const 
   }
 }
 
-inline CscDeviceHandle CpuStagingChannel::deviceHandle() const {
-  CscDeviceHandle h;
+inline DeviceHostDeviceHandle DeviceHostStagingBuffer::deviceHandle() const {
+  DeviceHostDeviceHandle h;
   h.slabDev      = slabDevice_;
   h.ctrlDev      = ctrlDevice_;
   h.rank         = rank_;
   h.nRanks       = nRanks_;
   h.bytesPerRank = bytesPerRank_;
   h.slotStride   = slotStride_;
-  h.counterStride = sizeof(CscCounter);
+  h.counterStride = sizeof(DeviceHostCounter);
   return h;
 }
 
-// ── CpuStagingChannel::create() ──────────────────────────────────────────────
+// ── DeviceHostStagingBuffer::create() ──────────────────────────────────────────────
 // (Full implementation; included here as it's a header-only class.)
 
-namespace csc_detail {
+namespace device_host_detail {
 
 inline void createShm(std::string const& name, size_t size) {
   shm_unlink(name.c_str());
@@ -429,9 +466,9 @@ inline void publishStatus(std::shared_ptr<mscclpp::Communicator> boot,
   }
 }
 
-} // namespace csc_detail
+} // namespace device_host_detail
 
-inline CpuStagingChannel CpuStagingChannel::create(
+inline DeviceHostStagingBuffer DeviceHostStagingBuffer::create(
     size_t bytesPerRank,
     int nSlots,
     std::shared_ptr<mscclpp::Communicator> bootstrapComm,
@@ -439,7 +476,7 @@ inline CpuStagingChannel CpuStagingChannel::create(
     bool mapSlab, bool numaPlace,
     std::string const& nameTag) {
 
-  CpuStagingChannel buf;
+  DeviceHostStagingBuffer buf;
   buf.rank_        = rank;
   buf.nRanks_      = nRanks;
   buf.bytesPerRank_ = bytesPerRank;
@@ -460,15 +497,15 @@ inline CpuStagingChannel CpuStagingChannel::create(
     if (buf.isLeader_) {
       std::snprintf(localNames.slab, 128, "/mint_hsb_%s_slab", nameTag.c_str());
       std::snprintf(localNames.ctrl, 128, "/mint_hsb_%s_ctrl", nameTag.c_str());
-      csc_detail::createShm(localNames.slab, buf.slabBytes_);
-      csc_detail::createShm(localNames.ctrl, sizeof(CscCtrl));
+      device_host_detail::createShm(localNames.slab, buf.slabBytes_);
+      device_host_detail::createShm(localNames.ctrl, sizeof(DeviceHostCtrl));
     }
   } catch (std::exception const& ex) {
     createResult = ncclSystemError;
     createMsg = ex.what();
   }
-  csc_detail::publishStatus(bootstrapComm, rank, nRanks,
-                            createResult, createMsg, "CpuStagingChannel slab create");
+  device_host_detail::publishStatus(bootstrapComm, rank, nRanks,
+                            createResult, createMsg, "DeviceHostStagingBuffer slab create");
 
   std::vector<Names> allNames(static_cast<size_t>(nRanks));
   allNames[rank] = localNames;
@@ -482,15 +519,15 @@ inline CpuStagingChannel CpuStagingChannel::create(
   try {
     mscclpp::CudaDeviceGuard devGuard(cudaDevice);
 
-    buf.slabMapping_ = csc_detail::mapShm(buf.slabName_, buf.slabBytes_);
+    buf.slabMapping_ = device_host_detail::mapShm(buf.slabName_, buf.slabBytes_);
     buf.slab_        = static_cast<char*>(buf.slabMapping_);
-    buf.ctrlMapping_ = csc_detail::mapShm(buf.ctrlName_, sizeof(CscCtrl));
-    buf.ctrl_        = static_cast<CscCtrl*>(buf.ctrlMapping_);
+    buf.ctrlMapping_ = device_host_detail::mapShm(buf.ctrlName_, sizeof(DeviceHostCtrl));
+    buf.ctrl_        = static_cast<DeviceHostCtrl*>(buf.ctrlMapping_);
 
     // Leader zeros ctrl.
     if (buf.isLeader_) {
-      std::memset(buf.ctrlMapping_, 0, sizeof(CscCtrl));
-      new (buf.ctrl_) CscCtrl{};
+      std::memset(buf.ctrlMapping_, 0, sizeof(DeviceHostCtrl));
+      new (buf.ctrl_) DeviceHostCtrl{};
     }
     boot->barrier();
 
@@ -521,7 +558,7 @@ inline CpuStagingChannel CpuStagingChannel::create(
     }
 
     // Register ctrl with CUDA (always device-mapped for streamWriteValue64).
-    MSCCLPP_CUDATHROW(cudaHostRegister(buf.ctrlMapping_, sizeof(CscCtrl),
+    MSCCLPP_CUDATHROW(cudaHostRegister(buf.ctrlMapping_, sizeof(DeviceHostCtrl),
                                        cudaHostRegisterPortable | cudaHostRegisterMapped));
     buf.ctrlRegistered_ = true;
     {
@@ -533,16 +570,16 @@ inline CpuStagingChannel CpuStagingChannel::create(
     setupResult = ncclSystemError;
     setupMsg = ex.what();
   }
-  csc_detail::publishStatus(bootstrapComm, rank, nRanks,
-                            setupResult, setupMsg, "CpuStagingChannel setup");
+  device_host_detail::publishStatus(bootstrapComm, rank, nRanks,
+                            setupResult, setupMsg, "DeviceHostStagingBuffer setup");
   boot->barrier();
   return buf;
 }
 
-inline CpuStagingChannel::~CpuStagingChannel() {
+inline DeviceHostStagingBuffer::~DeviceHostStagingBuffer() {
   if (ctrlRegistered_)  cudaHostUnregister(ctrlMapping_);
   if (slabRegistered_)  cudaHostUnregister(slabMapping_);
-  if (ctrlMapping_)     munmap(ctrlMapping_, sizeof(CscCtrl));
+  if (ctrlMapping_)     munmap(ctrlMapping_, sizeof(DeviceHostCtrl));
   if (slabMapping_)     munmap(slabMapping_, slabBytes_);
   if (isLeader_) {
     if (!ctrlName_.empty()) shm_unlink(ctrlName_.c_str());

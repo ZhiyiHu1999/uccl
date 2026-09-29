@@ -89,12 +89,16 @@ With no GDR, all inter-node payloads pass through pinned host memory registered 
   `allgather_small_fallback.cuh`, `allgather_one_rank_pipeline.cuh`,
   `allgather_single_slab.cuh`, and `allgather_numa_split.cuh`.
   They submit whole invocations, not generic per-chunk Stage/Gather loops.
-  `network_service.hpp` bridges to shared scheduling implementations in
-  `../allgather_multinode.cu`: `executeOrderedSmallSchedule`,
+  `network_service.hpp` bridges to GPU-private scheduling implementations in
+  `network_service.cu`: `executeOrderedSmallSchedule`,
   `executeSmallFallbackSchedule`, `executeSingleSlabSchedule`, and
-  `executeNumaSchedule`. Both CPU entry points and the device service call these
-  same schedules; `runOneRankChunkPipeline` and the group-copy/RDMA primitives
-  remain shared. Do not recreate approximate versions under the device entries.
+  `executeNumaSchedule`. Their reference is the CPU implementation, but they
+  are independently compiled and maintained. GPU fixes must not modify native
+  `../allgather_intranode.cu` or `../allgather_multinode.cu`.
+* `host_staging_buffer.hpp` owns GPU-private `DeviceHostStagingBuffer`, including
+  its explicit move/resource ownership. Do not modify `../cpu_staging_channel.hpp`
+  as part of GPU-only work. Low-level CpuSwitch and NodeExchangeBuffer remain
+  shared dependencies; changes to those require an explicit cross-path review.
 * Prepare dedicated reference contexts, mappings, QPs, streams and events during
   handle initialization. Their epochs/layouts are independent of native host
   calls and the legacy reduction proxy. FIFO sequence numbers are invocation
@@ -111,7 +115,7 @@ With no GDR, all inter-node payloads pass through pinned host memory registered 
   the native kernels: after a size change, their addresses can contain old
   payload bytes greater than the expected epoch. FIFO and monotonic control
   counters retain their >= waits. Both modes retain error/timeout handling.
-* The CPU service may execute shared transport schedules and their bootstrap
+* The CPU service may execute GPU-private transport schedules and their bootstrap
   reuse barriers, but must not call public/native host collective entry points
   or wait on the user's kernel stream. Publish FIFO completion only after
   transport output and any CTA SM phase finish. Polling must observe aborts.

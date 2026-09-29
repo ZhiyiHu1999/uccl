@@ -245,3 +245,24 @@ Hardware regression: run 2n×4g directly at `-b 1M -e 1M -w 20 -n 50`, then
 preflight must pass both in-place modes and aligned/unaligned buffers. Confirm
 the actual selected network path if failures persist; this correction targets
 SingleSlab, not a claim that every possible preflight failure is resolved.
+
+## CPU/GPU implementation isolation
+
+The three native files (`allgather_intranode.cu`, `allgather_multinode.cu`,
+`cpu_staging_channel.hpp`) are restored byte-for-byte to `0a1edbea`.
+The GPU-private network implementation is now `gpu_driven/network_service.cu`;
+GPU host staging uses `gpu_driven/host_staging_buffer.hpp`. Earlier references
+in this log to shared schedules describe the pre-isolation implementation.
+
+Checks performed:
+- Byte comparisons against the baseline pass for all three restored files.
+- Whitespace-normalized body comparisons pass for the migrated SingleSlab,
+  SmallFallback, NUMA, pipeline, exchange/copy helpers and device service bridge.
+- The private staging class matches the preceding ownership-fixed version after
+  normalizing its private type names and relative include path.
+- The 84-case OrderedSmall host simulation passes against the isolated schedule.
+  Native kernel-launch branches and native entry wrappers were removed from the
+  private translation unit; the caller CTA still performs its SM phases.
+- Make dry-run resolves the new CUDA compilation rule. Actual compilation stops
+  because nvcc is unavailable. Real CUDA/MPI linking and hardware regression are
+  still required; this refactor does not claim to fix the outstanding 2n×4g issue.

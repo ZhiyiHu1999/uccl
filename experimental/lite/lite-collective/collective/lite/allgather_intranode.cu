@@ -72,7 +72,7 @@ static bool hostAllGatherSelfKernelEnabled() {
   char const* e = std::getenv("MSCCLPP_NCCL_HOST_ALLGATHER_SELF_KERNEL");
   return e != nullptr && std::strcmp(e, "0") != 0;
 }
-static bool hostStagingNumaPlacementEnabled() {
+static bool hostAllGatherNumaPlacementEnabled() {
   char const* e = std::getenv("MSCCLPP_NCCL_HOST_ALLGATHER_NUMA_PLACE");
   return e != nullptr && std::strcmp(e, "0") != 0;
 }
@@ -345,7 +345,7 @@ static void initializeHostAllGatherContext(
         bootstrapComm,
         rank, nRanks, cudaDevice,
         ctx.mapSlab,
-        hostStagingNumaPlacementEnabled(),
+        hostAllGatherNumaPlacementEnabled(),
         tag));
 
     int leastPri = 0, greatestPri = 0;

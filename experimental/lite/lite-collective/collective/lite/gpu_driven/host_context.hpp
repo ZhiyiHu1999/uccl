@@ -7,8 +7,15 @@
 
 #include "lite/node_exchange_buffer.hpp"
 #include "network_service.hpp"
+#include "host_staging_buffer.hpp"
 
 namespace {
+
+static bool deviceHostStagingNumaPlacementEnabled() {
+  char const* value = std::getenv("MSCCLPP_NCCL_HOST_ALLGATHER_NUMA_PLACE");
+  return value != nullptr && std::strcmp(value, "0") != 0;
+}
+
 
 struct DeviceCollectiveContext {
   std::mutex mutex;
@@ -31,7 +38,7 @@ struct DeviceCollectiveContext {
   cudaStream_t serviceStreams[4]{};
   cudaEvent_t serviceEvents[kLiteTaskSlots][4]{};
   std::thread serviceThread;
-  std::unique_ptr<HostStagingBuffer> hostBuffer;
+  std::unique_ptr<DeviceHostStagingBuffer> hostBuffer;
   std::unique_ptr<NodeExchangeBuffer> nodeBuffer;
   mscclpp::RegisteredMemory rdmaSendMemory;
   mscclpp::RegisteredMemory rdmaRecvMemory;
@@ -576,7 +583,7 @@ static void fillDeviceCollectiveHandle(
   if (context.nranks == 1) return;
 
   if (context.backend == mscclppDeviceCollectiveHostMemory) {
-    CscDeviceHandle raw = context.hostBuffer->deviceHandle();
+    auto raw = context.hostBuffer->deviceHandle();
     if (raw.ctrlDev == nullptr) {
       throw mscclpp::Error(
           "device collective requires GPU-mapped shared host memory",
@@ -917,11 +924,11 @@ mscclppGetDeviceCollectiveHandle(ncclComm_t comm, size_t maxBytesPerRank,
           std::snprintf(tagBuffer, sizeof(tagBuffer), "device_%d_%llx",
                         getpid(), nc);
           context->hostBuffer =
-              std::make_unique<HostStagingBuffer>(HostStagingBuffer::create(
+              std::make_unique<DeviceHostStagingBuffer>(DeviceHostStagingBuffer::create(
                   context->maxBytesPerRank, MSCCLPP_DEVICE_COLLECTIVE_SLOTS,
                   comm->comm, rank, nranks, comm->cudaDevice,
                   /*mapSlab=*/policy.mapSlab != 0,
-                  hostStagingNumaPlacementEnabled(), tagBuffer));
+                  deviceHostStagingNumaPlacementEnabled(), tagBuffer));
         }
         std::vector<int> controlStatus(nranks);
         controlStatus[rank] =
