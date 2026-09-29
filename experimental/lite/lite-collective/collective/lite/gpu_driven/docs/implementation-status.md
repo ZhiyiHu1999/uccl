@@ -25,10 +25,15 @@ AllReduce and ReduceScatter implement Sum, Min and Max for arithmetic template t
 
 ## AllGather selection
 
-Host policy is snapshotted during collective initialization. Shared-host AllGather requires explicit `MSCCLPP_NCCL_HOST_ALLGATHER=1`, total output within the configured minimum and 1 GiB maximum, and no capture. The benchmark explicitly opts into host mode unless configured otherwise. Mapped, cooperative-phase and DMA branches retain their priority, alignment and capability conditions. Cooperative phases support a full cooperative grid; the benchmark retains one block (one SM). Per-rank chunks default to B up to 1 MiB, 1 MiB through 32 MiB, then 4 MiB, retaining the host tuning variables.
+Host policy is snapshotted during collective initialization. Host memory is the single-node default and the fallback for an IPC preference; two-node handles use host RDMA even when IPC was requested. Native host enable/minimum/1-GiB admission gates do not restrict GPU-driven AllGather. Capacity and no-capture validation still apply. Mapped, cooperative-phase and DMA branches retain their priority, alignment and capability conditions. Cooperative phases support a full cooperative grid; the benchmark retains one block (one SM). Per-rank chunks default to B up to 1 MiB, 1 MiB through 32 MiB, then 4 MiB, retaining the host tuning variables.
 
-CUDA IPC AllGather requires host AllGather disabled, IPC event synchronization
-enabled, total output at least 8 MiB, and no capture. Its independent
+CUDA IPC AllGather requires an explicit `cuda_ipc` preference, all-pair peer access,
+IPC event synchronization enabled, total output at least 8 MiB, and no capture.
+Host fallback resources are initialized once, with independent epochs and FIFO.
+Unsupported peer access or disabled event sync returns a host handle; smaller
+calls on an IPC handle select its host fallback before publishing work.
+Allocation/registration failures and in-flight errors propagate; no retry under
+a different protocol is attempted. This adds host staging memory to IPC setup. Its independent
 `allgather_ipc.cuh` routine sends complete rank blocks to next's registered output
 using CPU-submitted D2D DMA, with one epoch and `nranks - 1` steps per invocation.
 GPU threads only publish tasks and synchronize; the IPC path does not SM-copy

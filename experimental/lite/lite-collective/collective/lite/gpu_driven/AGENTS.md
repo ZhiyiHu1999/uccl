@@ -151,25 +151,31 @@ Symbols：
 * D2D copy directly.
 * No other operation when in-place.
 
+#### Backend preference contract
+
+* Unset `UCCL_GPU_DRIVEN_BACKEND` (or `host`) uses host memory on one node and host RDMA on two nodes.
+* `cuda_ipc` prefers IPC for eligible single-node AllGather calls; otherwise use host memory. Two-node initialization always resolves to host RDMA.
+* `MSCCLPP_NCCL_HOST_ALLGATHER` does not gate GPU-driven AllGather or override IPC preference. Native CPU-driven semantics are unchanged.
+* Peer-access eligibility is agreed by all ranks during setup. Invalid arguments, unsupported topology/capture, resource allocation errors, and in-flight transport failures remain errors, not independent protocol switches.
+
 #### Case 2: one node only, multiple ranks
 
 * CUDA IPC ring AllGather
   * Similar algorithm as `runIntraNodeCudaIpcAllGather()` in `allgather_intranode.cu`.
   * This path is choosen when all below conditions are met:
-    * `HOST_ALLGATHER` (host SHM) is disabled (this option is disabled by default, and `MSCCLPP_NCCL_CUDAIPC_EVENT_SYNC` is enabled by default);
+    * CUDA IPC is explicitly requested, and every GPU pair supports peer access;
     * ~~`hasIB=true`;~~  (Do not implement this rule, it is a bug in host-driven case)
     * IPC event sync is enabled；
     * `T ≥ 8 MiB`;
     * No CUDA Graph capture.
 * Through shared host memory
-  * Not a fallback of 'CUDA IPC ring AllGather', requires explicit enabling.
+  * Default backend and fallback for ineligible IPC calls. Initialize host resources before returning an IPC-preferred handle; select the protocol before publishing work, never after an operation fails.
   * Similar algorithm as `runIntraNodeShmAllGather()` in `allgather_intranode.cu`.
     * Implement internel paths [`hostAllGatherMappedKernel()`](/Users/zhiyihu/Desktop/pr_to_uccl/uccl/experimental/lite/lite-collective/collective/lite/allgather_intranode.cu:151), [`hostAllGatherCoopKernel()`](/Users/zhiyihu/Desktop/pr_to_uccl/uccl/experimental/lite/lite-collective/collective/lite/allgather_intranode.cu:190), and [`runIntraNodeShmAllGather()` ](/Users/zhiyihu/Desktop/pr_to_uccl/uccl/experimental/lite/lite-collective/collective/lite/allgather_intranode.cu:507)as in host-driven case (selection conditions are all kept, `hostAllGatherCoopKernel()` should also be kept even if we use only one CTA for GPU-driven collectives).
     * Chunk size also follow the logics in host-driven collectives.
   * This path is chosen when all below conditions are met:
-    * `MSCCLPP_NCCL_HOST_ALLGATHER` is enabled
-    * `T ≤ 1 GiB`
-    * satisfy the lower bound of `HOST_ALLGATHER_MIN_BYTES`
+    * IPC was not requested, or IPC capability/event-sync/size eligibility is unmet.
+    * Bytes fit the initialized handle capacity. GPU-driven fallback ignores the native host enable/minimum/1-GiB admission gates; host subpath tuning remains supported.
     * No CUDA Graph capture
 
 ##### Case 2 SHM path details: shared-host subpaths and chunking

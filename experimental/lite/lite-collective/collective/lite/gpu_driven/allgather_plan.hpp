@@ -10,7 +10,7 @@
 #endif
 
 // Policy is snapshotted collectively at initialization. No getenv, allocation,
-// CUDA runtime call, or protocol fallback is allowed inside a device call.
+// CUDA runtime call, or mid-operation protocol fallback is allowed inside a device call.
 struct LiteAllGatherPolicy {
   size_t minBytes = 0;
   size_t kernelMaxBytes = 4096;
@@ -62,18 +62,12 @@ LITE_PLAN_HD inline LiteAllGatherPlan litePlanAllGather(
   }
   if (graphCaptured) return p;
   if (nranks == ranksPerNode) {
-    if (ipc) {
-      if (!policy.hostEnabled && policy.ipcEventSync &&
-          total >= 8 * 1024 * 1024) {
-        p.path = LiteDeviceAllGatherPath::IpcRing;
-        p.chunkBytes = bytes;  // IPC DMA ring sends one complete rank block per hop.
-        p.stageWithSm = p.receiveWithSm = true;
-      }
+    if (ipc && policy.ipcEventSync && total >= 8 * 1024 * 1024) {
+      p.path = LiteDeviceAllGatherPath::IpcRing;
+      p.chunkBytes = bytes;  // IPC DMA ring sends one complete rank block per hop.
+      p.stageWithSm = p.receiveWithSm = true;
       return p;
     }
-    if (!policy.hostEnabled || total < policy.minBytes ||
-        total > (size_t{1} << 30))
-      return p;
     size_t chunk = bytes <= 1024 * 1024        ? bytes
                    : bytes <= 32 * 1024 * 1024 ? 1024 * 1024
                                                : 4 * 1024 * 1024;
@@ -93,7 +87,7 @@ LITE_PLAN_HD inline LiteAllGatherPlan litePlanAllGather(
     p.stageWithSm = p.receiveWithSm = p.path != LiteDeviceAllGatherPath::HostDma;
     return p;
   }
-  if (nranks != 2 * ranksPerNode || ipc) return p;
+  if (nranks != 2 * ranksPerNode) return p;
   size_t smallLimit = ranksPerNode == 1 ? 2 * 1024 * 1024 : 128 * 1024;
   if (total < smallLimit) {
     // Ordered slots also support DMA-only payloads. Mapping controls SM

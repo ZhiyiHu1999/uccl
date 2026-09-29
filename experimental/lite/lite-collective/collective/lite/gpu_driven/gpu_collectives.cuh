@@ -51,6 +51,7 @@ typedef struct mscclppDeviceCollectiveHandle {
   unsigned long long* groupDone[MSCCLPP_DEVICE_COLLECTIVE_MAX_RANKS];
   int groupCount;
   mscclppDeviceCollectiveHandle const* numaHandle;
+  mscclppDeviceCollectiveHandle const* hostFallbackHandle;
   unsigned long long* slotReusable;
   unsigned long long* publishedBytes;
   size_t publishedBytesSlotStride;
@@ -77,7 +78,8 @@ extern "C" {
 /*
 Collective host-side initialization.
 Every rank in comm must call with the same backend and maxBytesPerRank.
-CUDA IPC requires peer access between every participating GPU pair.
+CUDA IPC is a preference: eligible AllGather calls use IPC; other sizes use
+preinitialized host memory. Missing peer access selects host memory at setup.
 Balanced two-node communicators automatically use host-staged RDMA.
 */
 ncclResult_t mscclppGetDeviceCollectiveHandle(
@@ -486,7 +488,17 @@ static __device__ __forceinline__ int liteAllGatherBlock(
       !original.networkAllGather && original.numaHandle && original.nranks > 0 &&
       bytesPerRank <= SIZE_MAX / static_cast<size_t>(original.nranks) &&
       bytesPerRank * original.nranks >= 128 * 1024;
-  auto const& h = useNuma ? *original.numaHandle : original;
+  auto const& selected = useNuma ? *original.numaHandle : original;
+  auto preferred = litePlanAllGather(
+      selected.allGatherPolicy, selected.nranks, selected.ranksPerNode,
+      selected.backend == mscclppDeviceCollectiveCudaIpc, true,
+      selected.maxBytesPerRank, bytesPerRank, 0, graphCaptured);
+  bool useHost = selected.backend == mscclppDeviceCollectiveCudaIpc &&
+                 preferred.path != LiteDeviceAllGatherPath::IpcRing &&
+                 preferred.path != LiteDeviceAllGatherPath::Copy;
+  if (useHost && !selected.hostFallbackHandle)
+    return mscclppDeviceCollectiveInvalidUsage;
+  auto const& h = useHost ? *selected.hostFallbackHandle : selected;
   if (!mscclppDeviceCollectiveHandleValid(h) || !srcVoid || !dstVoid)
     return mscclppDeviceCollectiveInvalidArgument;
   bool mapped =

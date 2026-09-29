@@ -371,7 +371,15 @@ static void runComparison(BenchCollective collective, size_t bytes, int warmups,
   CUDA_CHECK(cudaMalloc(&input, inputCount * sizeof(float) + 16));
   CUDA_CHECK(cudaMalloc(&output, outputCount * sizeof(float) + 16));
   bool ipcOutput = collective == BenchCollective::AllGather &&
-                   handle.backend == mscclppDeviceCollectiveCudaIpc;
+                   handle.backend == mscclppDeviceCollectiveCudaIpc &&
+                   litePlanAllGather(handle.allGatherPolicy, nranks,
+                       handle.ranksPerNode, true, true, handle.maxBytesPerRank,
+                       bytes, 0).path == LiteDeviceAllGatherPath::IpcRing;
+  if (!rank && collective == BenchCollective::AllGather)
+    std::printf("allgather bytes_per_rank=%zu selected_backend=%s\n", bytes,
+                ipcOutput ? "cuda_ipc" :
+                handle.backend == mscclppDeviceCollectiveHostRdma
+                    ? "host_rdma" : "host");
   if (ipcOutput)
     NCCL_CHECK(mscclppRegisterDeviceCollectiveIpcOutput(
         liteComm, output, outputCount * sizeof(float) + 16));

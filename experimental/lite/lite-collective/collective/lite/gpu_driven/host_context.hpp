@@ -26,6 +26,7 @@ struct DeviceCollectiveContext {
   std::vector<std::unique_ptr<DeviceCollectiveContext>> groups;
   std::unique_ptr<DeviceCollectiveContext> numaContext;
   mscclppDeviceCollectiveHandle_t* numaDeviceHandle = nullptr;
+  mscclppDeviceCollectiveHandle_t* hostFallbackDeviceHandle = nullptr;
   LiteAllGatherPolicy allGatherPolicy{};
   bool reductionsMapped = false;
   unsigned long long timeoutCycles = 0;
@@ -84,6 +85,8 @@ struct DeviceCollectiveContext {
     numaContext.reset();
     if (numaDeviceHandle) cudaFree(numaDeviceHandle);
     numaDeviceHandle = nullptr;
+    if (hostFallbackDeviceHandle) cudaFree(hostFallbackDeviceHandle);
+    hostFallbackDeviceHandle = nullptr;
     // Drain issued copies before destroying events, registrations or slabs.
     for (auto& stream : serviceStreams) {
       if (stream) {
@@ -580,6 +583,7 @@ static void fillDeviceCollectiveHandle(
   handle->networkAllGatherGroups = context.nativeAllGatherGroups;
   handle->timeoutCycles = context.timeoutCycles;
   handle->numaHandle = context.numaDeviceHandle;
+  handle->hostFallbackHandle = context.hostFallbackDeviceHandle;
   if (context.nranks == 1) return;
 
   if (context.backend == mscclppDeviceCollectiveHostMemory) {
@@ -765,8 +769,7 @@ mscclppGetDeviceCollectiveHandle(ncclComm_t comm, size_t maxBytesPerRank,
   bool singleNode = nranks == nRanksPerNode;
   bool twoNodes = nRanksPerNode > 0 && nranks == 2 * nRanksPerNode;
   if (nranks < 1 || nranks > MSCCLPP_DEVICE_COLLECTIVE_MAX_RANKS ||
-      (!singleNode && !twoNodes) ||
-      (twoNodes && backend == mscclppDeviceCollectiveCudaIpc)) {
+      (!singleNode && !twoNodes)) {
     return ncclInvalidUsage;
   }
   if (maxBytesPerRank >= kLiteCompactNetworkBit ||
@@ -786,7 +789,9 @@ mscclppGetDeviceCollectiveHandle(ncclComm_t comm, size_t maxBytesPerRank,
       char const* value = std::getenv(key);
       return value ? std::strcmp(value, "0") != 0 : fallback;
     };
-    policy.hostEnabled = enabled("MSCCLPP_NCCL_HOST_ALLGATHER", false);
+    // GPU-driven host is the default and the mandatory IPC fallback.
+    // The native CPU-driven enable/disable switch does not gate this API.
+    policy.hostEnabled = 1;
     policy.ipcEventSync = enabled("MSCCLPP_NCCL_CUDAIPC_EVENT_SYNC", true);
     policy.mapSlab = hostAllGatherMapSlabEnabled();
     policy.selfCopyWithSm = hostAllGatherSelfKernelEnabled();
@@ -844,8 +849,16 @@ mscclppGetDeviceCollectiveHandle(ncclComm_t comm, size_t maxBytesPerRank,
     }
     for (auto const& config : configs)
       policy.cooperative &= config.policy.cooperative;
+    // Validate requested preferences collectively before resolving topology.
+    if (twoNodes) backend = mscclppDeviceCollectiveHostMemory;
+    mscclppDeviceCollectiveHandle_t hostFallback{};
     if (backend == mscclppDeviceCollectiveCudaIpc) {
-      int localStatus = 0;
+      ncclResult_t result = mscclppGetDeviceCollectiveHandle(
+          comm, maxBytesPerRank, mscclppDeviceCollectiveHostMemory, &hostFallback);
+      if (result != ncclSuccess)
+        throw mscclpp::Error("host fallback initialization failed",
+                             mscclpp::ErrorCode::SystemError);
+      int localStatus = policy.ipcEventSync ? 0 : 1;
       for (int r = 0; r < nranks; ++r) {
         if (r == rank) continue;
         int canAccessPeer = 0;
@@ -859,9 +872,8 @@ mscclppGetDeviceCollectiveHandle(ncclComm_t comm, size_t maxBytesPerRank,
                                          sizeof(peerStatuses[0]));
       if (std::any_of(peerStatuses.begin(), peerStatuses.end(),
                       [](int status) { return status != 0; })) {
-        throw mscclpp::Error(
-            "CUDA IPC backend requires peer access between every GPU pair",
-            mscclpp::ErrorCode::InvalidUsage);
+        *handle = hostFallback;
+        return;
       }
     }
 
@@ -894,6 +906,12 @@ mscclppGetDeviceCollectiveHandle(ncclComm_t comm, size_t maxBytesPerRank,
       try {
         std::vector<int> allocationStatus(nranks);
         try {
+          if (backend == mscclppDeviceCollectiveCudaIpc) {
+            MSCCLPP_CUDATHROW(cudaMalloc(&context->hostFallbackDeviceHandle,
+                                         sizeof(hostFallback)));
+            MSCCLPP_CUDATHROW(cudaMemcpy(context->hostFallbackDeviceHandle,
+                &hostFallback, sizeof(hostFallback), cudaMemcpyHostToDevice));
+          }
           MSCCLPP_CUDATHROW(
               cudaMalloc(&context->allGatherGridState, sizeof(LiteAllGatherGridState)));
           MSCCLPP_CUDATHROW(

@@ -44,7 +44,8 @@ NP=2 CUDA_VISIBLE_DEVICES=0,1 UCCL_GPU_DRIVEN_BACKEND=cuda_ipc \
 ```
 
 Two-rank IPC AllGather requires at least 4 MiB input per rank. Starting at 128B
-is accepted but smaller ineligible sizes are skipped. There is no fixed
+uses host memory below that threshold and IPC above it when peer access is available.
+`MSCCLPP_NCCL_HOST_ALLGATHER` no longer affects GPU-driven selection. There is no fixed
 wall-clock timeout on the benchmark run.
 
 Both `benchmark.sh` and `device_collectives_bench` accept
@@ -266,3 +267,22 @@ Checks performed:
 - Make dry-run resolves the new CUDA compilation rule. Actual compilation stops
   because nvcc is unavailable. Real CUDA/MPI linking and hardware regression are
   still required; this refactor does not claim to fix the outstanding 2n×4g issue.
+
+
+Backend preference regression (run on CUDA hosts):
+
+```sh
+# Small -> IPC -> small exercises independent host/IPC epochs in one process.
+NP=4 CUDA_VISIBLE_DEVICES=0,1,2,3 UCCL_GPU_DRIVEN_BACKEND=cuda_ipc \
+  bash collective/lite/gpu_driven/benchmark.sh -c allgather 128B 2M 128B 2M
+# Event-sync disabled must use host for every size.
+NP=4 CUDA_VISIBLE_DEVICES=0,1,2,3 UCCL_GPU_DRIVEN_BACKEND=cuda_ipc \
+  MSCCLPP_NCCL_CUDAIPC_EVENT_SYNC=0 \
+  bash collective/lite/gpu_driven/benchmark.sh -c allgather 128B 2M
+# With HOSTS set to two nodes, this must select host_rdma.
+NP=2 CUDA_VISIBLE_DEVICES=0 UCCL_GPU_DRIVEN_BACKEND=cuda_ipc \
+  bash collective/lite/gpu_driven/benchmark.sh -c allgather 128B 4M
+```
+
+Also repeat with the preference unset, host enable set to both 0 and 1,
+and peer access unavailable. Check per-size selected_backend log lines.
