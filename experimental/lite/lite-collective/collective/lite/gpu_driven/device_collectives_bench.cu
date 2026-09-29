@@ -614,10 +614,11 @@ int main(int argc, char** argv) {
   NCCL_CHECK(ncclCommInitRank(&comm, nranks, id, rank));
 
   char const* backendEnv = std::getenv("UCCL_GPU_DRIVEN_BACKEND");
-  mscclppDeviceCollectiveBackend_t backend = mscclppDeviceCollectiveHostMemory;
-  if (backendEnv != nullptr && std::strcmp(backendEnv, "cuda_ipc") == 0) {
-    backend = mscclppDeviceCollectiveCudaIpc;
-  } else if (backendEnv != nullptr && std::strcmp(backendEnv, "host") != 0) {
+  mscclppDeviceCollectiveBackend_t backend = mscclppDeviceCollectiveCudaIpc;
+  if (backendEnv != nullptr && std::strcmp(backendEnv, "host") == 0) {
+    backend = mscclppDeviceCollectiveHostMemory;
+  } else if (backendEnv != nullptr && backendEnv[0] != '\0' &&
+             std::strcmp(backendEnv, "cuda_ipc") != 0) {
     if (rank == 0) {
       std::fprintf(stderr,
                    "UCCL_GPU_DRIVEN_BACKEND must be host or cuda_ipc\n");

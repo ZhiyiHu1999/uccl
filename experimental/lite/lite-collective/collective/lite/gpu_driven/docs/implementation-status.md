@@ -25,9 +25,9 @@ AllReduce and ReduceScatter implement Sum, Min and Max for arithmetic template t
 
 ## AllGather selection
 
-Host policy is snapshotted during collective initialization. Host memory is the single-node default and the fallback for an IPC preference; two-node handles use host RDMA even when IPC was requested. Native host enable/minimum/1-GiB admission gates do not restrict GPU-driven AllGather. Capacity and no-capture validation still apply. Mapped, cooperative-phase and DMA branches retain their priority, alignment and capability conditions. Cooperative phases support a full cooperative grid; the benchmark retains one block (one SM). Per-rank chunks default to B up to 1 MiB, 1 MiB through 32 MiB, then 4 MiB, retaining the host tuning variables.
+Host policy is snapshotted during collective initialization. Unset/empty `UCCL_GPU_DRIVEN_BACKEND` defaults to an IPC preference, as does `cuda_ipc`. Explicit `host` selects host memory on one node. Host memory is the fallback for an IPC preference; two-node handles use host RDMA even when IPC was requested. Native host enable/minimum/1-GiB admission gates do not restrict GPU-driven AllGather. Capacity and no-capture validation still apply. Mapped, cooperative-phase and DMA branches retain their priority, alignment and capability conditions. Cooperative phases support a full cooperative grid; the benchmark retains one block (one SM). Per-rank chunks default to B up to 1 MiB, 1 MiB through 32 MiB, then 4 MiB, retaining the host tuning variables.
 
-CUDA IPC AllGather requires an explicit `cuda_ipc` preference, all-pair peer access,
+CUDA IPC AllGather requires a `cuda_ipc` preference (the default when unset/empty), all-pair peer access,
 IPC event synchronization enabled, total output at least 8 MiB, and no capture.
 Host fallback resources are initialized once, with independent epochs and FIFO.
 Unsupported peer access or disabled event sync returns a host handle; smaller

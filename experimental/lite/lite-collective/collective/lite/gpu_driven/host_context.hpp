@@ -789,7 +789,7 @@ mscclppGetDeviceCollectiveHandle(ncclComm_t comm, size_t maxBytesPerRank,
       char const* value = std::getenv(key);
       return value ? std::strcmp(value, "0") != 0 : fallback;
     };
-    // GPU-driven host is the default and the mandatory IPC fallback.
+    // GPU-driven host is always available as the mandatory IPC fallback.
     // The native CPU-driven enable/disable switch does not gate this API.
     policy.hostEnabled = 1;
     policy.ipcEventSync = enabled("MSCCLPP_NCCL_CUDAIPC_EVENT_SYNC", true);
