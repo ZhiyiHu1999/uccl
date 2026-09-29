@@ -340,7 +340,8 @@ static void runComparison(BenchCollective collective, size_t bytes, int warmups,
           bytes);
     return;
   }
-  if (collective != BenchCollective::AllGather && !handle.reductionsMapped) {
+  if (collective != BenchCollective::AllGather && !handle.reductionsMapped &&
+      !(collective == BenchCollective::ReduceScatter && handle.reduceScatterPrepared)) {
     if (!rank)
       std::printf(
           "%s bytes_per_rank=%zu skipped: reductions require mapped payloads\n",
@@ -380,6 +381,15 @@ static void runComparison(BenchCollective collective, size_t bytes, int warmups,
                 ipcOutput ? "cuda_ipc" :
                 handle.backend == mscclppDeviceCollectiveHostRdma
                     ? "host_rdma" : "host");
+  if (!rank && collective == BenchCollective::ReduceScatter) {
+    auto plan = litePlanReduceScatter(handle.reduceScatterPolicy, nranks,
+        handle.ranksPerNode, handle.maxBytesPerRank, bytes, true,
+        handle.reduceScatterIpc, handle.reduceScatterMapped);
+    std::printf("reducescatter bytes_per_rank=%zu path=%s chunk_bytes=%zu slots=%u lead=%u "
+                "async=%d split=%d host_final=%d async_final=%d eager=%d\n",
+                bytes, liteReduceScatterPathName(plan.path), plan.chunkBytes, plan.slots, plan.lead,
+                plan.recordAsync, plan.splitFinal, plan.hostFinal, plan.asyncFinal, plan.eagerPost);
+  }
   if (ipcOutput)
     NCCL_CHECK(mscclppRegisterDeviceCollectiveIpcOutput(
         liteComm, output, outputCount * sizeof(float) + 16));
@@ -408,11 +418,13 @@ static void runComparison(BenchCollective collective, size_t bytes, int warmups,
   } else {
     for (bool inPlace : {false, true})
       for (auto op : {liteReduceSum, liteReduceMin, liteReduceMax}) {
+        if (!handle.reductionsMapped && op != liteReduceSum) continue;
         checkReduction<<<1, 256>>>(handle, input, output, count,
                                    collective == BenchCollective::ReduceScatter,
                                    inPlace, op, errors);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
+        if (!handle.reductionsMapped) continue;
         checkReduction<<<1, 256>>>(handle, reinterpret_cast<int*>(input),
                                    reinterpret_cast<int*>(output), count,
                                    collective == BenchCollective::ReduceScatter,
@@ -421,6 +433,8 @@ static void runComparison(BenchCollective collective, size_t bytes, int warmups,
         CUDA_CHECK(cudaDeviceSynchronize());
       }
   }
+  if (!rank && collective == BenchCollective::ReduceScatter && !handle.reductionsMapped)
+    std::printf("reducescatter preflight coverage=float/sum; generic int/min/max unavailable without mapped payloads\n");
   unsigned localErrors = 0, totalErrors = 0;
   CUDA_CHECK(cudaMemcpy(&localErrors, errors, sizeof(unsigned),
                         cudaMemcpyDeviceToHost));

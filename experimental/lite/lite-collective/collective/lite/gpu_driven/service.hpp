@@ -118,6 +118,43 @@ static void runDeviceCollectiveService(DeviceCollectiveContext* context) {
         if (item.ticket) break;
         item.task = c.tasks->slots[index].task;
         auto const& task = item.task;
+        if (task.kind == LiteTaskKind::RsCopy) {
+          if (!c.reduceScatter || task.rs.stream < 0 || task.rs.stream > 3)
+            throw mscclpp::Error("invalid RsCopy",
+                                 mscclpp::ErrorCode::InvalidUsage);
+          enqueueLiteRsCopy(*c.reduceScatter, c.serviceStreams[task.rs.stream],
+                            task);
+          MSCCLPP_CUDATHROW(cudaEventRecord(c.serviceEvents[index][0],
+                                            c.serviceStreams[task.rs.stream]));
+          item.eventCount = 1;
+          item.ticket = ++next;
+          progress = true;
+          continue;
+        }
+        if (task.kind == LiteTaskKind::RsHostSum ||
+            task.kind == LiteTaskKind::RsBarrier) {
+          if (!c.reduceScatter)
+            throw mscclpp::Error("ReduceScatter was not prepared",
+                                 mscclpp::ErrorCode::InvalidUsage);
+          if (task.kind == LiteTaskKind::RsHostSum)
+            executeLiteRsHostSum(*c.reduceScatter, task);
+          else
+            executeLiteRsBarrier(*c.reduceScatter, task);
+          ++next;
+          __atomic_store_n(&c.tasks->slots[index].completed, next,
+                           __ATOMIC_RELEASE);
+          progress = true;
+          continue;
+        }
+        if (task.kind == LiteTaskKind::ReduceScatter) {
+          if (!c.reduceScatter)
+            throw mscclpp::Error("ReduceScatter was not prepared", mscclpp::ErrorCode::InvalidUsage);
+          executeLiteReduceScatter(*c.reduceScatter, task);
+          ++next;
+          __atomic_store_n(&c.tasks->slots[index].completed, next, __ATOMIC_RELEASE);
+          progress = true;
+          continue;
+        }
         if (task.kind == LiteTaskKind::NetworkAllGather) {
           if (!c.nativeAllGatherNetwork)
             throw mscclpp::Error("network AllGather was not prepared",
@@ -308,6 +345,10 @@ static void initializeDeviceCollectiveService(DeviceCollectiveContext& c,
     throw mscclpp::Error("device FIFO/stream initialization failed",
                          mscclpp::ErrorCode::SystemError);
   try {
+    if (c.reduceScatter) {
+      c.reduceScatter->fifo = c.tasks;
+      c.reduceScatter->stop = &c.stopRdmaProxy;
+    }
     if (c.nranks > 1)
       c.serviceThread = std::thread(runDeviceCollectiveService, &c);
     if (c.backend == mscclppDeviceCollectiveHostRdma) {

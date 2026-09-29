@@ -8,8 +8,11 @@
 #include "lite/node_exchange_buffer.hpp"
 #include "network_service.hpp"
 #include "host_staging_buffer.hpp"
+#include "lite/cpu_switch/cpu_reduction.hpp"
 
 namespace {
+
+#include "reducescatter_service.hpp"
 
 static bool deviceHostStagingNumaPlacementEnabled() {
   char const* value = std::getenv("MSCCLPP_NCCL_HOST_ALLGATHER_NUMA_PLACE");
@@ -28,6 +31,7 @@ struct DeviceCollectiveContext {
   mscclppDeviceCollectiveHandle_t* numaDeviceHandle = nullptr;
   mscclppDeviceCollectiveHandle_t* hostFallbackDeviceHandle = nullptr;
   LiteAllGatherPolicy allGatherPolicy{};
+  std::unique_ptr<LiteReduceScatterContext> reduceScatter;
   bool reductionsMapped = false;
   unsigned long long timeoutCycles = 0;
   char* smallOutput = nullptr;
@@ -80,6 +84,7 @@ struct DeviceCollectiveContext {
       group->stopRdmaProxy.store(true, std::memory_order_release);
     if (serviceThread.joinable()) serviceThread.join();
     if (rdmaProxyThread.joinable()) rdmaProxyThread.join();
+    reduceScatter.reset();
     for (auto& group : groups)
       if (group->rdmaProxyThread.joinable()) group->rdmaProxyThread.join();
     numaContext.reset();
@@ -181,6 +186,7 @@ struct DeviceCollectiveConfig {
   int backend;
   int cudaDevice;
   LiteAllGatherPolicy policy;
+  LiteReduceScatterPolicy reduceScatterPolicy;
   int ibCount;
   int numaNode;
 };
@@ -578,6 +584,13 @@ static void fillDeviceCollectiveHandle(
   handle->ranksPerNode = context.nRanksPerNode;
   handle->reductionsMapped = context.reductionsMapped;
   handle->allGatherPolicy = context.allGatherPolicy;
+  if (context.reduceScatter) {
+    handle->reduceScatterPrepared = 1;
+    handle->reduceScatterPolicy = context.reduceScatter->policy;
+    handle->reduceScatterIpc = context.reduceScatter->ipc;
+    handle->reduceScatterMapped = context.reduceScatter->mapped;
+    handle->reduceScatterView = context.reduceScatter->view();
+  }
   handle->tasks = context.tasksDevice;
   handle->networkAllGather = context.nativeAllGatherNetwork != nullptr;
   handle->networkAllGatherGroups = context.nativeAllGatherGroups;
@@ -785,6 +798,7 @@ mscclppGetDeviceCollectiveHandle(ncclComm_t comm, size_t maxBytesPerRank,
     mscclpp::CudaDeviceGuard deviceGuard(comm->cudaDevice);
     std::vector<DeviceCollectiveConfig> configs(nranks);
     LiteAllGatherPolicy policy;
+    auto rsPolicy = readLiteReduceScatterPolicy();
     auto enabled = [](char const* key, bool fallback) {
       char const* value = std::getenv(key);
       return value ? std::strcmp(value, "0") != 0 : fallback;
@@ -816,6 +830,7 @@ mscclppGetDeviceCollectiveHandle(ncclComm_t comm, size_t maxBytesPerRank,
                      static_cast<int>(backend),
                      comm->cudaDevice,
                      policy,
+                     rsPolicy,
                      0,
                      -1};
     try {
@@ -840,7 +855,8 @@ mscclppGetDeviceCollectiveHandle(ncclComm_t comm, size_t maxBytesPerRank,
           config.policy.minBytes != policy.minBytes ||
           config.policy.kernelMaxBytes != policy.kernelMaxBytes ||
           config.policy.coopMaxBytes != policy.coopMaxBytes ||
-          config.policy.chunkBytes != policy.chunkBytes) {
+          config.policy.chunkBytes != policy.chunkBytes ||
+          !sameLiteReduceScatterPolicy(config.reduceScatterPolicy, rsPolicy)) {
         throw mscclpp::Error(
             "all ranks must initialize the same device collective backend "
             "and maxBytesPerRank",
@@ -970,6 +986,12 @@ mscclppGetDeviceCollectiveHandle(ncclComm_t comm, size_t maxBytesPerRank,
           context->nativeAllGatherNetwork = mscclpp::nccl::prepareDeviceAllGatherNetwork(
               comm, comm->comm, rank, nranks, nRanksPerNode, comm->cudaDevice,
               context->maxBytesPerRank, &context->nativeAllGatherGroups);
+        if (nranks > 1 && (nRanksPerNode == 1 || nRanksPerNode == 2 || nRanksPerNode == 4)) {
+          context->reduceScatter = std::make_unique<LiteReduceScatterContext>();
+          context->reduceScatter->policy = rsPolicy;
+          prepareLiteReduceScatter(*context->reduceScatter, comm, context->maxBytesPerRank,
+              twoNodes || backend == mscclppDeviceCollectiveCudaIpc);
+        }
         initializeDeviceCollectiveService(*context, comm);
         if (twoNodes && nRanksPerNode > 2)
           initializeNumaDeviceCollective(*context, comm, configs);
@@ -985,6 +1007,10 @@ mscclppGetDeviceCollectiveHandle(ncclComm_t comm, size_t maxBytesPerRank,
           mscclpp::ErrorCode::InvalidUsage);
     }
 
+    if (context->reduceScatter &&
+        !sameLiteReduceScatterPolicy(context->reduceScatter->policy, rsPolicy))
+      throw mscclpp::Error("ReduceScatter policy cannot change on an initialized handle",
+                           mscclpp::ErrorCode::InvalidUsage);
     fillDeviceCollectiveHandle(*context, handle);
   });
 }

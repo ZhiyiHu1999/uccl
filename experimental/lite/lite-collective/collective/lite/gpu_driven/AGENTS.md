@@ -37,7 +37,43 @@ Collective algorithms are composed of primitive operations. Collective layer is 
 
 #### ReduceScatter
 
-TBD
+* Read [design/reducescatter.md](design/reducescatter.md) before modifying
+  selection, scratch layouts, CTA phases, transport schedules, or setup.
+  The CPU references are `nccl/ReduceScatter/{single-node,multi-node}.cu`,
+  especially `runLiteInterReduceScatter`; do not substitute AllReduce's
+  different `runSendRecvReduceScatter` dispatch.
+* `reducescatter_plan.hpp` owns float/sum policy and topology/size selection.
+  `reducescatter.cuh` switches on `plan.path` to one `__device__` entry per path
+  (`reducescatter_{ipc,host,two_rank,hierarchical}.cuh`, named
+  `liteReduceScatter<Path>Block`). Primitives are split by executor: FIFO primitives
+  (`RsCopy`, `RsHostSum`, `RsBarrier`, executed by the service) for anything that needs
+  the CPU, copy engines or NIC, and CTA primitives (`liteRsSum`) for SM work, declared
+  in `reducescatter_primitives.cuh`. Single-node paths are composed from them on the
+  device; the two-node paths still submit one whole-invocation task through
+  `liteRsInvokePath` with a CPU schedule. Adding a path means adding its plan branch,
+  its device entry (and, for two-node paths, its CPU schedule case), and its row in the
+  design document.
+  `reducescatter_generic.cuh` retains the
+  arithmetic-template sum/min/max fallback.
+* `reducescatter_service.hpp` owns GPU-private resources and phase primitives;
+  `reducescatter_local_schedule.hpp` and `reducescatter_network_schedule.hpp`
+  implement local and two-node schedules. Do not call CPU collective entry
+  points, native NCCL, or launch kernels from these schedules.
+* Capacity bounds the **full input**, while selection thresholds use output
+  shard bytes B or full input T as documented. Preserve in-place ownership.
+  Generic reductions still require mapped slabs; optimized float/sum supports
+  DMA-only host payloads through CPU reduction/H2D or GPU scratch.
+* Compare RS policy and capability collectively before starting workers.
+  Keep FIFO tickets, CTA phase sequences, RS chunk epochs, and generic/AG
+  epochs separate. Only consumer completion permits ACK and scratch reuse.
+* Policy defaults in `reducescatter_plan.hpp` must track the CPU reference per layout
+  (2n×2g and 2n×4g differ in lead, split-final, host-read final add, async final and
+  eager post). When changing a CPU default, mirror it in the plan and in the policy
+  table of the design document; deliberate deviations belong in its "Known
+  deviations" list.
+* Use the existing benchmark for correctness/performance coverage. Include
+  tails, repeated/mixed sizes, in-place, all five target layouts, IPC/no-IPC,
+  and mapped/DMA paths. Record missing CUDA/IB hardware validation explicitly.
 
 #### AllReduce
 

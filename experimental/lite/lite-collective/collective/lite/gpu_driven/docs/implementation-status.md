@@ -6,7 +6,7 @@ Call `mscclppGetDeviceCollectiveHandle` collectively once, then pass its handle 
 
 Supported topologies are one rank, or 2–8 total ranks on one or two balanced nodes, including 1n×2g, 1n×4g, 2n×1g, 2n×2g and 2n×4g. Rank numbering must be node-contiguous. Device compilation requires sm_70 or newer for system-scope acquire/release. All inter-node payloads reside in pinned host memory registered with IB; there is no GDR path.
 
-AllReduce and ReduceScatter implement Sum, Min and Max for arithmetic template types (benchmark coverage includes int and float). ReduceScatter capacity is the complete input size, not the receiving shard. In-place ReduceScatter uses `dst = src + rank * recvCount`. Reductions require all payload slabs to be device mapped; AllGather additionally supports DMA-only slabs. One-rank calls copy directly, skipping identical pointers.
+AllReduce and ReduceScatter implement Sum, Min and Max for arithmetic template types (benchmark coverage includes int and float). ReduceScatter capacity is the complete input size, not the receiving shard. In-place ReduceScatter uses `dst = src + rank * recvCount`. Generic reductions require mapped payload slabs. Optimized float/sum ReduceScatter also supports DMA-only host staging; see [ReduceScatter design](../design/reducescatter.md). One-rank calls copy directly, skipping identical pointers.
 
 `liteAllGatherBlock` accepts an optional `graphCaptured` argument. It must describe the enclosing kernel launch; multi-rank AllGather rejects capture/replay before publishing work. Ordinary four-argument callers remain supported. The device cannot discover host stream capture state.
 
@@ -15,6 +15,8 @@ AllReduce and ReduceScatter implement Sum, Min and Max for arithmetic template t
 | File | Responsibility |
 | --- | --- |
 | `allgather_plan.hpp` | Side-effect-free topology, size, alignment and policy selection |
+| `reducescatter_plan.hpp`, `reducescatter.cuh`, `reducescatter_{ipc,host,two_rank,hierarchical}.cuh` | RS selection, validation, per-path device entries and caller-CTA arithmetic phases |
+| `reducescatter_service.hpp`, `reducescatter_*_schedule.hpp` | Private RS setup and local/network scheduling |
 | `task_fifo.hpp` | DMA descriptors, FIFO ownership and system-scope publication |
 | `gpu_collectives.cuh` | Device handle, single-CTA collectives, staging, reduction and retirement |
 | `host_context.hpp` | Collective setup, NUMA discovery, registrations, connections, network proxies and cleanup |

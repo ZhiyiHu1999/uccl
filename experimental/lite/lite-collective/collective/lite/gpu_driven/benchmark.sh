@@ -118,6 +118,13 @@ for variable in \
   fi
 done
 
+# RS policy must match on remote MPI ranks as well as local ranks.
+while IFS= read -r variable; do
+  if [[ "${variable}" == MSCCLPP_NCCL_RS_* ]]; then
+    MPI_ARGS+=(-x "${variable}")
+  fi
+done < <(compgen -e)
+
 mkdir -p "$(dirname "${RESULT_FILE}")"
 RAW_OUTPUT="$(mktemp "${TMPDIR:-/tmp}/gpu-driven-benchmark.XXXXXX")"
 trap 'rm -f "${RAW_OUTPUT}"' EXIT
@@ -186,3 +193,11 @@ awk -v selected="${SELECTED_COLLECTIVE}" '
 ' "${RAW_OUTPUT}" >>"${RESULT_FILE}"
 
 echo "[gpu-driven-benchmark] Markdown result: ${RESULT_FILE}" >&2
+
+if [[ "${SELECTED_COLLECTIVE}" == reducescatter || "${SELECTED_COLLECTIVE}" == all ]]; then
+  {
+    printf '\n## ReduceScatter paths\n\n```text\n'
+    awk '/^reducescatter / && (/path=/ || /preflight coverage=/)' "${RAW_OUTPUT}"
+    printf '```\n'
+  } >>"${RESULT_FILE}"
+fi
