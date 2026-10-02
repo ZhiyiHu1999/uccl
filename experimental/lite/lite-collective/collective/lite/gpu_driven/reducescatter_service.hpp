@@ -10,12 +10,16 @@ static_assert(sizeof(LiteRsSharedControl) <= 4096, "RS control page");
 
 struct LiteReduceScatterContext {
   LiteReduceScatterPolicy policy{};
+  LiteAllReducePolicy arPolicy{};
   int rank = 0, ranks = 0, local = 0, me = 0, node = 0;
   bool ipc = false, mapped = false;
   size_t capacity = 0, chunkCapacity = 0, ringCapacity = 0, stride = 0;
   unsigned slots = 1;
   uint64_t epoch = 0, phase = 0;
-  uint64_t previous[5]{};
+  // previous: last epoch whose local consumers (barrier row 2) retired;
+  // previousAck: last epoch whose remote ACK is expected (RS chunks and AllReduce
+  // node leaders; other AllReduce ranks never exchange ACKs).
+  uint64_t previous[5]{}, previousAck[5]{};
   std::unique_ptr<NodeExchangeBuffer> host;
   char* scratch = nullptr;
   char* peers[4]{};
@@ -26,6 +30,8 @@ struct LiteReduceScatterContext {
   cudaEvent_t postEvents[5]{};
   LiteRsLayout layout;
   mscclpp::Connection connection;
+  // Second independent channel of the two-rank AllReduce ring (2n*1g only).
+  mscclpp::Connection connection2;
   mscclpp::RegisteredMemory sendMemory, recvMemory, remoteMemory;
   LiteTaskFifo* fifo = nullptr;
   std::atomic<bool>* stop = nullptr;
@@ -34,6 +40,7 @@ struct LiteReduceScatterContext {
     for (auto s : streams)
       if (s) cudaStreamSynchronize(s);
     connection = {};
+    connection2 = {};
     remoteMemory = {};
     recvMemory = {};
     sendMemory = {};
@@ -137,15 +144,16 @@ struct LiteReduceScatterContext {
   }
   // Signalling memory is stable until flush. Payload and ready are ordered on
   // the same CPU-memory QP. ACK is sent only after H2D/CTA consumption.
-  void signal(unsigned slot, unsigned kind, uint64_t e) {
+  void signal(unsigned slot, unsigned kind, uint64_t e, int channel = 0) {
     unsigned sourceKind = kind + 6;
     auto* word = &ctrl()->value[slot][sourceKind][me];
     *word = e;
     size_t src = reinterpret_cast<char*>(word) - host->sendPtr();
     size_t dst = reinterpret_cast<char*>(&ctrl(true)->value[slot][kind][me]) -
                  host->recvPtr();
-    connection.write(remoteMemory, dst, sendMemory, src, sizeof(uint64_t));
-    connection.flush();
+    auto& conn = channel ? connection2 : connection;
+    conn.write(remoteMemory, dst, sendMemory, src, sizeof(uint64_t));
+    conn.flush();
   }
 };
 
@@ -262,11 +270,7 @@ static void prepareLiteReduceScatter(LiteReduceScatterContext& c,
   c.node = c.rank / c.local;
   c.capacity = capacity;
   c.slots = c.ranks == c.local ? 1 : c.local == 1 ? 5 : 4;
-  c.chunkCapacity =
-      std::max(size_t{4},
-               std::min(capacity / c.ranks, std::max(c.policy.chunkCapacity,
-                                                     c.policy.hostBulkChunk))) &
-      ~size_t{3};
+  c.chunkCapacity = liteRsChunkCapacity(c.policy, capacity, c.ranks);
   c.ringCapacity =
       c.ranks == c.local
           ? std::max(size_t{4}, std::min(capacity / c.ranks,
@@ -403,9 +407,13 @@ static void prepareLiteReduceScatter(LiteReduceScatterContext& c,
     mscclpp::EndpointConfig config(transport,
                                    mscclpp::Device(mscclpp::DeviceType::CPU));
     auto connection = comm->comm->connect(config, peer, tag);
+    // The 2n*1g AllReduce ring drives two independent channels.
+    auto second = c.local == 1 ? comm->comm->connect(config, peer, tag + 2)
+                               : connection;
     comm->comm->sendMemory(c.recvMemory, peer, tag + 1);
     auto memory = comm->comm->recvMemory(peer, tag + 1);
     c.connection = connection.get();
+    if (c.local == 1) c.connection2 = second.get();
     c.remoteMemory = memory.get();
   }
 }

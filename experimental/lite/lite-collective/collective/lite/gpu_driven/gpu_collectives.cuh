@@ -66,6 +66,7 @@ typedef struct mscclppDeviceCollectiveHandle {
   int reductionsMapped;
   LiteAllGatherPolicy allGatherPolicy;
   LiteReduceScatterPolicy reduceScatterPolicy;
+  LiteAllReducePolicy allReducePolicy;
   LiteRsDeviceView reduceScatterView;
   int reduceScatterPrepared;
   int reduceScatterIpc;
@@ -552,10 +553,12 @@ static __device__ __forceinline__ int liteAllGatherBlock(
   }
 }
 
-// Block-scoped AllReduce.  Each rank contributes count elements and receives
+// Block-scoped full-tensor AllReduce (the Generic path of liteAllReduceBlock):
+// every rank stages the complete tensor through the mapped payload slab and
+// reduces it element-wise. Each rank contributes count elements and receives
 // the element-wise reduction of all ranks.  T must support +, <, and >.
 template <typename T>
-static __device__ __forceinline__ int liteAllReduceBlock(
+static __device__ __forceinline__ int liteAllReduceGenericBlock(
     mscclppDeviceCollectiveHandle_t const& h, T const* src, T* dst,
     size_t count, liteReduceOp op = liteReduceSum) {
   __shared__ unsigned long long epoch;
@@ -623,5 +626,6 @@ static __device__ __forceinline__ int liteAllReduceBlock(
 
 #include "reducescatter_generic.cuh"
 #include "reducescatter.cuh"
+#include "allreduce.cuh"
 
 #endif  // defined(__CUDACC__)

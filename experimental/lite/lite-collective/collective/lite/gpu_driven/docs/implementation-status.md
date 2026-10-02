@@ -17,6 +17,8 @@ AllReduce and ReduceScatter implement Sum, Min and Max for arithmetic template t
 | `allgather_plan.hpp` | Side-effect-free topology, size, alignment and policy selection |
 | `reducescatter_plan.hpp`, `reducescatter.cuh`, `reducescatter_{ipc,host,two_rank,hierarchical}.cuh` | RS selection, validation, per-path device entries and caller-CTA arithmetic phases |
 | `reducescatter_service.hpp`, `reducescatter_*_schedule.hpp` | Private RS setup and local/network scheduling |
+| `allreduce_plan.hpp`, `allreduce.cuh`, `allreduce_{rs_ag,small,two_rank_ring}.cuh` | AllReduce selection, validation and per-path device entries |
+| `allreduce_service.hpp` | AllReduce policy and the CPU schedules of the two-node paths (reuses the RS context) |
 | `task_fifo.hpp` | DMA descriptors, FIFO ownership and system-scope publication |
 | `gpu_collectives.cuh` | Device handle, single-CTA collectives, staging, reduction and retirement |
 | `host_context.hpp` | Collective setup, NUMA discovery, registrations, connections, network proxies and cleanup |

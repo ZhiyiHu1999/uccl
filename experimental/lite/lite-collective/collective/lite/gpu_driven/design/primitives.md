@@ -321,6 +321,14 @@ switches, alignment/tails, in-place, FIFO wrap, mixed message sizes, epoch/slot 
 and error propagation across participants, and run the collective correctness preflight
 in the corresponding single-node/multi-node GPU environment.
 
+## AllReduce
+
+AllReduce introduces no primitive of its own. `ReduceScatterAllGather` calls the
+ReduceScatter and AllGather entries back to back; the two-node small and ring paths submit a
+whole-invocation `AllReduce` FIFO task (`LiteTaskKind::AllReduce`) and execute the CTA copy/sum
+phases their CPU schedule requests through the same `liteRsInvokeTask` loop as the
+ReduceScatter network paths. See [allreduce.md](allreduce.md).
+
 ## ReduceScatter CTA phase primitive
 
 `LiteTaskKind::ReduceScatter`, like network AllGather, is submitted to the FIFO per

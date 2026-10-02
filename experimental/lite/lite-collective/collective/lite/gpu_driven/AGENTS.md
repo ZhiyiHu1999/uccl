@@ -77,7 +77,20 @@ Collective algorithms are composed of primitive operations. Collective layer is 
 
 #### AllReduce
 
-TBD
+* Read [design/allreduce.md](design/allreduce.md) before modifying selection, paths,
+  policy or schedules. The CPU reference is `runSendRecvAllReduce` and its helpers in
+  `nccl/native_collectives.cu`; requirements are in `reduction-requirements.md`.
+* `allreduce_plan.hpp` owns float/sum policy and selection. `allreduce.cuh` switches on
+  `plan.path` to one `__device__` entry per path (`allreduce_{rs_ag,small,two_rank_ring}.cuh`,
+  named `liteAllReduce<Path>Block`); `liteAllReduceGenericBlock` (in `gpu_collectives.cuh`)
+  remains the type/op/irregular-count fallback. ReduceScatterAllGather composes the
+  ReduceScatter and AllGather entries; the two-node paths submit one `AllReduce` task whose
+  CPU schedule lives in `allreduce_service.hpp` and reuses the ReduceScatter context.
+* Keep the tensor size `B` and the shard size `S = B / R` apart: RS and AG thresholds take
+  `S`. Never truncate the tensor to make `C` divisible; use the Generic path.
+* Adding a path means adding its plan branch, its device entry, its schedule case in
+  `executeLiteAllReduce` (network paths) and its row in the design document. Keep the
+  single-CTA contract; do not call native NCCL or launch child kernels.
 
 ### Benchmark command-line requirements
 

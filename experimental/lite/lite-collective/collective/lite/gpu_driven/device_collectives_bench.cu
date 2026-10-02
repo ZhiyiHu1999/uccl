@@ -376,11 +376,33 @@ static void runComparison(BenchCollective collective, size_t bytes, int warmups,
                    litePlanAllGather(handle.allGatherPolicy, nranks,
                        handle.ranksPerNode, true, true, handle.maxBytesPerRank,
                        bytes, 0).path == LiteDeviceAllGatherPath::IpcRing;
+  if (collective == BenchCollective::AllReduce &&
+      handle.backend == mscclppDeviceCollectiveCudaIpc) {
+    // RS+AG runs the IPC-ring AllGather on shards of bytes / nranks; it pushes
+    // into the registered output exactly as standalone AllGather does.
+    auto ar = litePlanAllReduce(handle.allReducePolicy,
+        handle.reduceScatterPolicy, nranks, handle.ranksPerNode,
+        handle.maxBytesPerRank, bytes, true, handle.reduceScatterIpc,
+        handle.reduceScatterMapped);
+    ipcOutput = ar.path == LiteAllReducePath::ReduceScatterAllGather &&
+                litePlanAllGather(handle.allGatherPolicy, nranks,
+                    handle.ranksPerNode, true, true, handle.maxBytesPerRank,
+                    bytes / nranks, 0).path == LiteDeviceAllGatherPath::IpcRing;
+  }
   if (!rank && collective == BenchCollective::AllGather)
     std::printf("allgather bytes_per_rank=%zu selected_backend=%s\n", bytes,
                 ipcOutput ? "cuda_ipc" :
                 handle.backend == mscclppDeviceCollectiveHostRdma
                     ? "host_rdma" : "host");
+  if (!rank && collective == BenchCollective::AllReduce) {
+    // bytes is the complete tensor per rank; RS+AG uses shards of bytes / nranks.
+    auto plan = litePlanAllReduce(handle.allReducePolicy,
+        handle.reduceScatterPolicy, nranks, handle.ranksPerNode,
+        handle.maxBytesPerRank, bytes, true, handle.reduceScatterIpc,
+        handle.reduceScatterMapped);
+    std::printf("allreduce bytes=%zu path=%s chunk_bytes=%zu\n", bytes,
+                liteAllReducePathName(plan.path), plan.chunkBytes);
+  }
   if (!rank && collective == BenchCollective::ReduceScatter) {
     auto plan = litePlanReduceScatter(handle.reduceScatterPolicy, nranks,
         handle.ranksPerNode, handle.maxBytesPerRank, bytes, true,

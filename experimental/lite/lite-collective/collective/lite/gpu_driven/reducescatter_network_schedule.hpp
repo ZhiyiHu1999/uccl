@@ -145,13 +145,13 @@ static LiteRsChunk liteRsPrepareNetworkChunk(LiteReduceScatterContext& c,
           p.path == LiteReduceScatterPath::HostStaged ||
           (p.path == LiteReduceScatterPath::TwoRankSmall && !p.mappedSend);
   unsigned s = w.slot;
-  if (c.previous[s]) {
-    // Local consumers retired before this slot was released; remote ACK is
-    // independent of send completion, and persists across message regimes.
-    c.wait(&c.ctrl(true)->value[s][1][c.me], c.previous[s]);
+  // Local consumers retired before this slot was released; remote ACK is
+  // independent of send completion, and persists across message regimes.
+  if (c.previousAck[s])
+    c.wait(&c.ctrl(true)->value[s][1][c.me], c.previousAck[s]);
+  if (c.previous[s])
     for (int r = 0; r < c.local; ++r)
       c.wait(&c.ctrl()->value[s][2][r], c.previous[s]);
-  }
   LiteRsChunkView v;
   v.src = reinterpret_cast<char const*>(task.source) + offset;
   v.s = s;
@@ -254,7 +254,7 @@ static void liteRsFinishNetworkChunk(LiteReduceScatterContext& c,
   }
   c.barrier(s, 2, w.epoch);
   c.signal(s, 1, w.epoch);
-  c.previous[s] = w.epoch;
+  c.previous[s] = c.previousAck[s] = w.epoch;
 }
 
 // Same issue order as the CPU pipelines (runPipelinedChunks and the two-rank /

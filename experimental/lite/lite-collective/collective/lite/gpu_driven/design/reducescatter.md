@@ -50,7 +50,7 @@ whose mapped-slab requirement is unchanged.
 
 A single rank does a direct CTA copy (skipped when in place). One node, or two nodes with a uniform layout, up to eight ranks are supported. Dedicated optimizations cover 1n×2g, 1n×4g, 2n×1g, 2n×2g and 2n×4g; other supported layouts use the generic path.
 
-Initialization rejects three or more nodes: the multi-node schedule pairs each rank only with its same-local-index peer on the other node, so extra nodes would be silently skipped. AllReduce's implementation and path selection are not replaced by RS+AG because of this ReduceScatter work.
+Initialization rejects three or more nodes: the multi-node schedule pairs each rank only with its same-local-index peer on the other node, so extra nodes would be silently skipped. AllReduce composes this ReduceScatter with AllGather only in its own `ReduceScatterAllGather` path (see [allreduce.md](allreduce.md)); ReduceScatter itself never depends on AllReduce.
 
 ## CPU path correspondence
 

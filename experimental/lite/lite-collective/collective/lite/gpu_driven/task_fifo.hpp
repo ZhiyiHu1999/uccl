@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include "allgather_plan.hpp"
 #include "network_protocol.hpp"
+#include "allreduce_plan.hpp"
 #include "reducescatter_protocol.hpp"
 
 // Single CTA producer / CPU consumer. Dequeue, DMA completion, and payload
@@ -15,7 +16,7 @@ constexpr uint64_t kLitePackedNetworkBit = uint64_t{1} << 62;
 constexpr uint64_t kLiteCompactNetworkBit = uint64_t{1} << 61;
 constexpr uint64_t kLiteNetworkMask =
     kLiteGenericNetworkBit | kLitePackedNetworkBit | kLiteCompactNetworkBit;
-enum class LiteTaskKind : uint64_t { Stage, Gather, GatherPacked, IpcCopySelf, IpcPush, HostAllGather, NetworkAllGather, ReduceScatter, RsCopy, RsHostSum, RsBarrier };
+enum class LiteTaskKind : uint64_t { Stage, Gather, GatherPacked, IpcCopySelf, IpcPush, HostAllGather, NetworkAllGather, ReduceScatter, RsCopy, RsHostSum, RsBarrier, AllReduce };
 struct LiteTask {
   LiteTaskKind kind;
   uint64_t epoch;
@@ -30,6 +31,7 @@ struct LiteTask {
   bool selfCopyWithSm;
   LiteDeviceAllGatherPath networkPath;
   LiteReduceScatterPath reduceScatterPath;
+  LiteAllReducePath allReducePath;
   LiteRsOp rs;
 };
 struct alignas(64) LiteTaskSlot {

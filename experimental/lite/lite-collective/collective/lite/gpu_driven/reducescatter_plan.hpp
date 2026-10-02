@@ -66,6 +66,17 @@ LITE_RS_HD inline size_t liteRsLead(size_t configured, size_t fallback) {
   return configured == ~size_t{0} ? fallback : configured;
 }
 LITE_RS_HD inline size_t liteRsMin(size_t a, size_t b) { return a < b ? a : b; }
+// Row capacity of the RS scratch / host-slab layout. Shared by the service
+// (allocation) and the AllReduce planner so both derive the same bound.
+LITE_RS_HD inline size_t liteRsChunkCapacity(LiteReduceScatterPolicy const& q,
+                                            size_t capacity, int ranks) {
+  size_t cap = capacity / static_cast<size_t>(ranks);
+  size_t limit = q.chunkCapacity > q.hostBulkChunk ? q.chunkCapacity
+                                                   : q.hostBulkChunk;
+  if (cap > limit) cap = limit;
+  if (cap < 4) cap = 4;
+  return cap & ~size_t{3};
+}
 LITE_RS_HD inline LiteReduceScatterPlan litePlanReduceScatter(
     LiteReduceScatterPolicy const& q, int ranks, int local, size_t capacity,
     size_t bytes, bool floatSum, bool ipc, bool mapped) {

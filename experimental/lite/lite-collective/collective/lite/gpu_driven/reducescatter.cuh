@@ -5,9 +5,8 @@
 // FIFO descriptor tagged with plan.path. While the path's CPU schedule (the
 // like-named function in reducescatter_*_schedule.hpp) progresses DMA/RDMA, each
 // arithmetic phase it requests executes in this caller's CTA.
-static __device__ __forceinline__ int liteRsInvokePath(
-    mscclppDeviceCollectiveHandle_t const& h, float const* src, float* dst,
-    size_t bytes, LiteReduceScatterPlan const& plan) {
+static __device__ __forceinline__ int liteRsInvokeTask(
+    mscclppDeviceCollectiveHandle_t const& h, LiteTask const& task_) {
   __shared__ unsigned long long ticket, phase;
   __shared__ int status, sources;
   __shared__ size_t count;
@@ -24,12 +23,7 @@ static __device__ __forceinline__ int liteRsInvokePath(
     status = mscclppDeviceCollectiveSuccess;
     phase = liteLoadAcquire(
         reinterpret_cast<unsigned long long*>(&control->completed));
-    LiteTask task{};
-    task.kind = LiteTaskKind::ReduceScatter;
-    task.source = reinterpret_cast<uint64_t>(src);
-    task.destination = reinterpret_cast<uint64_t>(dst);
-    task.bytes = bytes;
-    task.reduceScatterPath = plan.path;
+    LiteTask task = task_;
     ticket = litePostTask(h, task);
     if (!ticket) status = mscclppDeviceCollectiveTransportError;
   }
@@ -86,6 +80,18 @@ static __device__ __forceinline__ int liteRsInvokePath(
           reinterpret_cast<unsigned long long*>(&control->completed), phase);
     __syncthreads();
   }
+}
+
+static __device__ __forceinline__ int liteRsInvokePath(
+    mscclppDeviceCollectiveHandle_t const& h, float const* src, float* dst,
+    size_t bytes, LiteReduceScatterPlan const& plan) {
+  LiteTask task{};
+  task.kind = LiteTaskKind::ReduceScatter;
+  task.source = reinterpret_cast<uint64_t>(src);
+  task.destination = reinterpret_cast<uint64_t>(dst);
+  task.bytes = bytes;
+  task.reduceScatterPath = plan.path;
+  return liteRsInvokeTask(h, task);
 }
 
 // Per-path device entries live in their own files, one function per plan path.

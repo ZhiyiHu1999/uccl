@@ -146,6 +146,17 @@ static void runDeviceCollectiveService(DeviceCollectiveContext* context) {
           progress = true;
           continue;
         }
+        if (task.kind == LiteTaskKind::AllReduce) {
+          if (!c.reduceScatter)
+            throw mscclpp::Error("AllReduce was not prepared",
+                                 mscclpp::ErrorCode::InvalidUsage);
+          executeLiteAllReduce(*c.reduceScatter, task);
+          ++next;
+          __atomic_store_n(&c.tasks->slots[index].completed, next,
+                           __ATOMIC_RELEASE);
+          progress = true;
+          continue;
+        }
         if (task.kind == LiteTaskKind::ReduceScatter) {
           if (!c.reduceScatter)
             throw mscclpp::Error("ReduceScatter was not prepared", mscclpp::ErrorCode::InvalidUsage);

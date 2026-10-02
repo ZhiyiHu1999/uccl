@@ -13,6 +13,7 @@
 namespace {
 
 #include "reducescatter_service.hpp"
+#include "allreduce_service.hpp"
 
 static bool deviceHostStagingNumaPlacementEnabled() {
   char const* value = std::getenv("MSCCLPP_NCCL_HOST_ALLGATHER_NUMA_PLACE");
@@ -187,6 +188,7 @@ struct DeviceCollectiveConfig {
   int cudaDevice;
   LiteAllGatherPolicy policy;
   LiteReduceScatterPolicy reduceScatterPolicy;
+  LiteAllReducePolicy allReducePolicy;
   int ibCount;
   int numaNode;
 };
@@ -587,6 +589,7 @@ static void fillDeviceCollectiveHandle(
   if (context.reduceScatter) {
     handle->reduceScatterPrepared = 1;
     handle->reduceScatterPolicy = context.reduceScatter->policy;
+    handle->allReducePolicy = context.reduceScatter->arPolicy;
     handle->reduceScatterIpc = context.reduceScatter->ipc;
     handle->reduceScatterMapped = context.reduceScatter->mapped;
     handle->reduceScatterView = context.reduceScatter->view();
@@ -799,6 +802,7 @@ mscclppGetDeviceCollectiveHandle(ncclComm_t comm, size_t maxBytesPerRank,
     std::vector<DeviceCollectiveConfig> configs(nranks);
     LiteAllGatherPolicy policy;
     auto rsPolicy = readLiteReduceScatterPolicy();
+    auto arPolicy = readLiteAllReducePolicy();
     auto enabled = [](char const* key, bool fallback) {
       char const* value = std::getenv(key);
       return value ? std::strcmp(value, "0") != 0 : fallback;
@@ -831,6 +835,7 @@ mscclppGetDeviceCollectiveHandle(ncclComm_t comm, size_t maxBytesPerRank,
                      comm->cudaDevice,
                      policy,
                      rsPolicy,
+                     arPolicy,
                      0,
                      -1};
     try {
@@ -856,7 +861,8 @@ mscclppGetDeviceCollectiveHandle(ncclComm_t comm, size_t maxBytesPerRank,
           config.policy.kernelMaxBytes != policy.kernelMaxBytes ||
           config.policy.coopMaxBytes != policy.coopMaxBytes ||
           config.policy.chunkBytes != policy.chunkBytes ||
-          !sameLiteReduceScatterPolicy(config.reduceScatterPolicy, rsPolicy)) {
+          !sameLiteReduceScatterPolicy(config.reduceScatterPolicy, rsPolicy) ||
+          !sameLiteAllReducePolicy(config.allReducePolicy, arPolicy)) {
         throw mscclpp::Error(
             "all ranks must initialize the same device collective backend "
             "and maxBytesPerRank",
@@ -989,6 +995,7 @@ mscclppGetDeviceCollectiveHandle(ncclComm_t comm, size_t maxBytesPerRank,
         if (nranks > 1 && (nRanksPerNode == 1 || nRanksPerNode == 2 || nRanksPerNode == 4)) {
           context->reduceScatter = std::make_unique<LiteReduceScatterContext>();
           context->reduceScatter->policy = rsPolicy;
+          context->reduceScatter->arPolicy = arPolicy;
           prepareLiteReduceScatter(*context->reduceScatter, comm, context->maxBytesPerRank,
               twoNodes || backend == mscclppDeviceCollectiveCudaIpc);
         }
@@ -1008,8 +1015,9 @@ mscclppGetDeviceCollectiveHandle(ncclComm_t comm, size_t maxBytesPerRank,
     }
 
     if (context->reduceScatter &&
-        !sameLiteReduceScatterPolicy(context->reduceScatter->policy, rsPolicy))
-      throw mscclpp::Error("ReduceScatter policy cannot change on an initialized handle",
+        (!sameLiteReduceScatterPolicy(context->reduceScatter->policy, rsPolicy) ||
+         !sameLiteAllReducePolicy(context->reduceScatter->arPolicy, arPolicy)))
+      throw mscclpp::Error("ReduceScatter/AllReduce policy cannot change on an initialized handle",
                            mscclpp::ErrorCode::InvalidUsage);
     fillDeviceCollectiveHandle(*context, handle);
   });

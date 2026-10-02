@@ -194,6 +194,14 @@ awk -v selected="${SELECTED_COLLECTIVE}" '
 
 echo "[gpu-driven-benchmark] Markdown result: ${RESULT_FILE}" >&2
 
+if [[ "${SELECTED_COLLECTIVE}" == allreduce || "${SELECTED_COLLECTIVE}" == all ]]; then
+  {
+    printf '\n## AllReduce paths\n\n```text\n'
+    awk '/^allreduce / && /path=/' "${RAW_OUTPUT}"
+    printf '```\n'
+  } >>"${RESULT_FILE}"
+fi
+
 if [[ "${SELECTED_COLLECTIVE}" == reducescatter || "${SELECTED_COLLECTIVE}" == all ]]; then
   {
     printf '\n## ReduceScatter paths\n\n```text\n'
