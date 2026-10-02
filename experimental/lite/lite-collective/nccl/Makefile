@@ -4,6 +4,15 @@
 #   mscclpp_nccl_static
 #   mscclpp_audit_nccl <- audit-shim/*.cc
 
+# Build in parallel by default (the CUDA translation units dominate build time).
+# Skipped when the caller already passed -j or a parent make shares its jobserver.
+# JOBS=N overrides the job count (capped at 16 by default, nvcc needs memory);
+# JOBS=1 builds serially.
+JOBS ?= $(shell n=$$(nproc 2>/dev/null || echo 4); [ $$n -gt 16 ] && n=16; echo $$n)
+ifeq ($(findstring jobserver,$(MAKEFLAGS))$(findstring -j,$(MAKEFLAGS)),)
+MAKEFLAGS += -j$(JOBS)
+endif
+
 NVCC      ?= nvcc
 CXX       ?= g++
 AR        ?= ar
