@@ -441,13 +441,18 @@ static void runComparison(BenchCollective collective, size_t bytes, int warmups,
     for (bool inPlace : {false, true})
       for (auto op : {liteReduceSum, liteReduceMin, liteReduceMax}) {
         if (!handle.reductionsMapped && op != liteReduceSum) continue;
-        checkReduction<<<1, 256>>>(handle, input, output, count,
+        // In-place AllReduce reduces inside one buffer. With an IPC-ring
+        // AllGather stage that buffer must be the registered output region.
+        float* source = input;
+        if (collective == BenchCollective::AllReduce && inPlace && ipcOutput)
+          source = output;
+        checkReduction<<<1, 256>>>(handle, source, output, count,
                                    collective == BenchCollective::ReduceScatter,
                                    inPlace, op, errors);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
         if (!handle.reductionsMapped) continue;
-        checkReduction<<<1, 256>>>(handle, reinterpret_cast<int*>(input),
+        checkReduction<<<1, 256>>>(handle, reinterpret_cast<int*>(source),
                                    reinterpret_cast<int*>(output), count,
                                    collective == BenchCollective::ReduceScatter,
                                    inPlace, op, errors);

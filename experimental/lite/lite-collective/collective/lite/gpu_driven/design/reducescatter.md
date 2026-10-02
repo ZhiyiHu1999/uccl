@@ -15,10 +15,10 @@ The in-place layout is `dst = src + rank*C`. Null pointers, zero counts,
 multiplication overflow, misalignment, invalid rank/op and over-capacity requests
 are rejected, and these checks complete before any FIFO work is published.
 
-* `reducescatter_plan.hpp`: pure host/device path selection (no allocation, memory access or global state, so the device caller, the service and the benchmark always agree). Each threshold compares either the per-rank output bytes B or the full input bytes T_bytes, exactly as the CPU reference does.
+* `reducescatter_plan.hpp`: pure host/device path selection (no allocation, memory access or global state, so the device caller, the service and the benchmark always agree). Each threshold compares either the per-rank output bytes B or the full input bytes T_bytes.
 * `reducescatter.cuh`: argument checks, float/sum dispatch, and `switch (plan.path)` to the per-path device entries. Also holds `liteRsInvokePath`, the single-CTA phase execution loop used by the two-node paths.
 * `reducescatter_primitives.cuh`: the device-side primitives (see "Primitives" below) that the single-node paths compose.
-* Per-path `__device__` entries, one function per plan path (like AllGather's `liteAllGather<Path>Block`), each checking its own prerequisites and naming its CPU reference:
+* Per-path `__device__` entries, one function per plan path, each checking its own prerequisites and naming its CPU reference:
   * `reducescatter_ipc.cuh`: `LocalRows`, `TwoLocal`, `P2pRing`, `IpcRing`. Composed on the device from primitives.
   * `reducescatter_host.cuh`: `HostSmall`, `HostRing`, `HostRead`, `HostBulk`. Composed on the device from primitives.
   * `reducescatter_two_rank.cuh`: `TwoRankSmall`, `TwoRankPipeline`. Whole-invocation task; CPU schedule.
@@ -31,15 +31,15 @@ are rejected, and these checks complete before any FIFO work is published.
 
 ### Primitives
 
-Each operation is executed by whichever agent it needs. Operations that need the CPU, the copy engines or the NIC are FIFO primitives executed by the service; operations that need the SMs are CTA primitives executed by the calling CTA. A single-node path is a `__device__` function that sequences them; every ticket is awaited before the path returns.
+Operations that need the CPU, the copy engines or the NIC are FIFO primitives executed by the service; operations that need the SMs are CTA primitives executed by the calling CTA. A single-node path is a `__device__` function that orchestrates them; every ticket (for every FIFO task) is awaited before the path returns.
 
-| Primitive | Executed by | Meaning |
-|---|---|---|
-| `liteRsCopyAsync` / `liteRsAwait` (`RsCopy`) | service stream (DMA) | 1D or 2D copy between any two UVA addresses: D2D over IPC, D2H, H2D. Streams 0–3 allow parallel copies |
-| `liteRsHostSum` (`RsHostSum`) | service CPU | float sum of up to four pinned-host rows into a host row (AVX-512 or scalar) |
-| `liteRsBarrier` (`RsBarrier`) | service | publish this rank's epoch in a control row of the node's host slab and wait for all local ranks |
-| `liteRsSum` | CTA threads | elementwise float sum of up to four rows in peer scratch / mapped host / input; volatile loads, system fence, CTA barrier |
-| `liteRsEpochLoad` / `liteRsEpochStore` | CTA thread 0 | persistent barrier epoch in the FIFO control page |
+| Primitive                                          | Executed by          | Meaning                                                                                                                   |
+| -------------------------------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `liteRsCopyAsync` / `liteRsAwait` (`RsCopy`) | service stream (DMA) | 1D or 2D copy between any two UVA addresses: D2D over IPC, D2H, H2D. Streams 0–3 allow parallel copies                   |
+| `liteRsHostSum` (`RsHostSum`)                  | service CPU          | float sum of up to four pinned-host rows into a host row (AVX-512 or scalar)                                              |
+| `liteRsBarrier` (`RsBarrier`)                  | service              | publish this rank's epoch in a control row of the node's host slab and wait for all local ranks                           |
+| `liteRsSum`                                      | CTA threads          | elementwise float sum of up to four rows in peer scratch / mapped host / input; volatile loads, system fence, CTA barrier |
+| `liteRsEpochLoad` / `liteRsEpochStore`         | CTA thread 0         | persistent barrier epoch in the FIFO control page                                                                         |
 
 Row addresses come from `LiteRsDeviceView` (peer GPU scratch pointers, CPU and device-mapped addresses of the host slab) using the same `LiteRsLayout` offset functions as the service. The two-node paths are not decomposed yet: they submit one whole-invocation `ReduceScatter` task and the CPU schedule requests the CTA phases (like AllGather's `NetworkAllGather`).
 
@@ -67,24 +67,24 @@ The reference is `runLiteInterReduceScatter()` in `nccl/ReduceScatter/multi-node
 
 ### Path table
 
-| Topology / condition                                                               | GPU path         | CPU reference function                                      | Device entry | Schedule |
-| ---------------------------------------------------------------------------------- | ---------------- | ----------------------------------------------------------- | --- | --- |
-| 1 rank                                                                             | Copy             | (trivial copy)                                              | (CTA copy in liteReduceScatterGenericBlock) | `-` |
-| 1n×4g, IPC, P2P forced or 256 KiB ≤ B ≤ 2 MiB                                   | P2pRing          | `runP2pRingReduceScatter`                                 | `liteReduceScatterP2pRingBlock` | device-composed |
-| 1n×4g, IPC, B ≥ 1 MiB and local ring on (default B ≥ 2 MiB)                     | IpcRing          | `runLocalFourRankRingReduceScatter`                       | `liteReduceScatterIpcRingBlock` | device-composed |
-| 1n×4g, IPC, otherwise                                                             | LocalRows        | `runLocalFourRankReduceScatter`                           | `liteReduceScatterLocalRowsBlock` | device-composed |
-| 1n×2g, IPC                                                                        | TwoLocal         | none (GPU extension of LocalRows)                           | `liteReduceScatterTwoLocalBlock` | device-composed |
-| Single node, no IPC, B ≤ 64 KiB                                                   | HostSmall        | `runNoCudaIpcHostReduceScatter`                           | `liteReduceScatterHostSmallBlock` | device-composed |
-| Single node, no IPC, mapped, direct ring on, B ≥ 1 MiB                            | HostRing         | `runNoCudaIpcDirectRingSingleNodeReduceScatter`           | `liteReduceScatterHostRingBlock` | device-composed |
-| Single node, no IPC, mapped, host-read on                                          | HostRead         | `runNoCudaIpcHostReadSingleNodeReduceScatter`             | `liteReduceScatterHostReadBlock` | device-composed |
-| Single node, no IPC, otherwise                                                     | HostBulk         | `runNoCudaIpcBulkSingleNodeReduceScatter`                 | `liteReduceScatterHostBulkBlock` | device-composed |
-| 2n×1g, B ≤ 512 KiB and slot capacity suffices                                    | TwoRankSmall     | `runTwoRankSmallHostReduceScatter`                        | `liteReduceScatterTwoRankSmallBlock` | `liteRsNetwork / liteRsPrepareTwoRankChunk` |
-| 2n×1g, otherwise                                                                  | TwoRankPipeline  | `runTwoRankReduceScatter` / `runTwoRankPipelinedChunks` | `liteReduceScatterTwoRankPipelineBlock` | `liteRsNetwork / liteRsPrepareTwoRankChunk` |
-| 2n×2g with T_bytes < 128 KiB, or 2n×4g with T_bytes < 512 KiB (slots sufficient) | SmallHost        | `runSmallHostReduceScatter`                               | `liteReduceScatterSmallHostBlock` | `liteRsNetwork / liteRsPrepareCpuChunk` |
-| 2n×2g / 2n×4g, no IPC                                                            | HostStaged       | `runNoCudaIpcHostReduceScatter` (multi-node)              | `liteReduceScatterHostStagedBlock` | `liteRsNetwork / liteRsPrepareCpuChunk` |
-| 2n×2g, hierarchy on                                                               | HierarchicalTwo  | `runTwoNodeTwoGpuHierReduceScatter`                       | `liteReduceScatterHierarchicalTwoBlock` | `liteRsNetwork / liteRsPrepareHierarchicalChunk` |
-| 2n×2g, hierarchy off                                                              | Generic          | (CPU: host NCCL send/recv fallback; not callable here)      | `liteReduceScatterGenericBlock` | (none) |
-| 2n×4g, otherwise                                                                  | HierarchicalFour | `runChunk` / `runPipelinedChunks`                       | `liteReduceScatterHierarchicalFourBlock` | `liteRsNetwork / liteRsPrepareHierarchicalChunk` |
+| Topology / condition                                                               | GPU path         | CPU reference function                                      | Device entry                                | Schedule                                           |
+| ---------------------------------------------------------------------------------- | ---------------- | ----------------------------------------------------------- | ------------------------------------------- | -------------------------------------------------- |
+| 1 rank                                                                             | Copy             | (trivial copy)                                              | (CTA copy in liteReduceScatterGenericBlock) | `-`                                              |
+| 1n×4g, IPC, P2P forced or 256 KiB ≤ B ≤ 2 MiB                                   | P2pRing          | `runP2pRingReduceScatter`                                 | `liteReduceScatterP2pRingBlock`           | device-composed                                    |
+| 1n×4g, IPC, B ≥ 1 MiB and local ring on (default B ≥ 2 MiB)                     | IpcRing          | `runLocalFourRankRingReduceScatter`                       | `liteReduceScatterIpcRingBlock`           | device-composed                                    |
+| 1n×4g, IPC, otherwise                                                             | LocalRows        | `runLocalFourRankReduceScatter`                           | `liteReduceScatterLocalRowsBlock`         | device-composed                                    |
+| 1n×2g, IPC                                                                        | TwoLocal         | none (GPU extension of LocalRows)                           | `liteReduceScatterTwoLocalBlock`          | device-composed                                    |
+| Single node, no IPC, B ≤ 64 KiB                                                   | HostSmall        | `runNoCudaIpcHostReduceScatter`                           | `liteReduceScatterHostSmallBlock`         | device-composed                                    |
+| Single node, no IPC, mapped, direct ring on, B ≥ 1 MiB                            | HostRing         | `runNoCudaIpcDirectRingSingleNodeReduceScatter`           | `liteReduceScatterHostRingBlock`          | device-composed                                    |
+| Single node, no IPC, mapped, host-read on                                          | HostRead         | `runNoCudaIpcHostReadSingleNodeReduceScatter`             | `liteReduceScatterHostReadBlock`          | device-composed                                    |
+| Single node, no IPC, otherwise                                                     | HostBulk         | `runNoCudaIpcBulkSingleNodeReduceScatter`                 | `liteReduceScatterHostBulkBlock`          | device-composed                                    |
+| 2n×1g, B ≤ 512 KiB and slot capacity suffices                                    | TwoRankSmall     | `runTwoRankSmallHostReduceScatter`                        | `liteReduceScatterTwoRankSmallBlock`      | `liteRsNetwork / liteRsPrepareTwoRankChunk`      |
+| 2n×1g, otherwise                                                                  | TwoRankPipeline  | `runTwoRankReduceScatter` / `runTwoRankPipelinedChunks` | `liteReduceScatterTwoRankPipelineBlock`   | `liteRsNetwork / liteRsPrepareTwoRankChunk`      |
+| 2n×2g with T_bytes < 128 KiB, or 2n×4g with T_bytes < 512 KiB (slots sufficient) | SmallHost        | `runSmallHostReduceScatter`                               | `liteReduceScatterSmallHostBlock`         | `liteRsNetwork / liteRsPrepareCpuChunk`          |
+| 2n×2g / 2n×4g, no IPC                                                            | HostStaged       | `runNoCudaIpcHostReduceScatter` (multi-node)              | `liteReduceScatterHostStagedBlock`        | `liteRsNetwork / liteRsPrepareCpuChunk`          |
+| 2n×2g, hierarchy on                                                               | HierarchicalTwo  | `runTwoNodeTwoGpuHierReduceScatter`                       | `liteReduceScatterHierarchicalTwoBlock`   | `liteRsNetwork / liteRsPrepareHierarchicalChunk` |
+| 2n×2g, hierarchy off                                                              | Generic          | (CPU: host NCCL send/recv fallback; not callable here)      | `liteReduceScatterGenericBlock`           | (none)                                             |
+| 2n×4g, otherwise                                                                  | HierarchicalFour | `runChunk` / `runPipelinedChunks`                       | `liteReduceScatterHierarchicalFourBlock`  | `liteRsNetwork / liteRsPrepareHierarchicalChunk` |
 
 With explicit `NO_CUDAIPC=1`, multi-node no-IPC layouts always take HostStaged, even for small T_bytes (the CPU never runs `runSmallHostReduceScatter` there); otherwise SmallHost is tried first.
 
