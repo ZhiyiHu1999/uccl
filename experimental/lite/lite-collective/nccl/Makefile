@@ -4,9 +4,20 @@
 #   mscclpp_nccl_static
 #   mscclpp_audit_nccl <- audit-shim/*.cc
 
+# Build in parallel by default (the CUDA translation units dominate build time).
+# Only the top-level make sets it, and not when the caller already passed -j.
+# JOBS=N overrides the job count (capped at 16 by default, nvcc needs memory);
+# JOBS=1 builds serially.
+JOBS ?= $(shell n=$$(nproc 2>/dev/null || echo 4); [ $$n -gt 16 ] && n=16; echo $$n)
+ifeq ($(MAKELEVEL)$(findstring -j,$(MAKEFLAGS)),0)
+MAKEFLAGS += -j$(JOBS)
+endif
+
 NVCC      ?= nvcc
 CXX       ?= g++
 AR        ?= ar
+MPI_HOME  ?= /usr/mpi/gcc/openmpi-4.1.7rc1
+MPI_CXX   ?= $(MPI_HOME)/bin/mpicxx
 
 MINT_DIR  := ..
 BUILD_DIR := $(MINT_DIR)/build
@@ -28,7 +39,8 @@ OUT_DIR   := build
 # ReduceScatter/single-node.cu is included by ReduceScatter/multi-node.cu.
 REDUCESCATTER_CU_SRCS := $(filter-out ReduceScatter/single-node.cu,$(wildcard ReduceScatter/*.cu))
 LITE_COLL_DIR := $(MINT_DIR)/collective/lite
-CU_SRCS   := $(wildcard *.cu) $(LITE_COLL_DIR)/allgather_multinode.cu $(REDUCESCATTER_CU_SRCS)
+GPU_DRIVEN_DIR := $(LITE_COLL_DIR)/gpu_driven
+CU_SRCS   := $(wildcard *.cu) $(LITE_COLL_DIR)/allgather_multinode.cu $(GPU_DRIVEN_DIR)/network_service.cu $(REDUCESCATTER_CU_SRCS)
 CU_OBJS   := $(patsubst %.cu,$(OUT_DIR)/%.cu.o,$(CU_SRCS))
 
 LIB_MINT      := $(BUILD_DIR)/libmint.so
@@ -42,13 +54,18 @@ AUDIT_OBJ    := $(OUT_DIR)/audit_nccl.o
 LDFLAGS := -L$(BUILD_DIR) -L$(CUDA_HOME)/lib64
 LDLIBS  := -Wl,--no-as-needed -lmint_collective -lmint -lcudart -lcuda -libverbs -lnuma \
            -lpthread -ldl -lstdc++fs
+NVCC_LDLIBS := -Xlinker --no-as-needed -lmint_collective -lmint -lcudart -lcuda \
+               -libverbs -lnuma -lpthread -ldl -lstdc++fs
 
-.PHONY: all clean mint-deps
+.PHONY: all clean mint-deps device-collectives-bench
 
-all: mint-deps $(LIB_NCCL_SO) $(LIB_NCCL_A) $(LIB_AUDIT_SO)
+all: mint-deps $(LIB_NCCL_SO) $(LIB_NCCL_A) $(LIB_AUDIT_SO) device-collectives-bench
 
 mint-deps:
 	$(MAKE) -C $(MINT_DIR) core collective
+
+$(LIB_MINT) $(LIB_MINT_COLL): mint-deps
+	@:
 
 $(OUT_DIR):
 	mkdir -p $@
@@ -64,8 +81,10 @@ $(OUT_DIR)/nccl.cu.o: $(LITE_COLL_DIR)/allgather_intranode.cu $(LITE_COLL_DIR)/h
 # CpuSwitch is header-based; rebuild its consumers after primitive/channel edits.
 CPU_SWITCH_HEADERS := $(wildcard $(LITE_COLL_DIR)/cpu_switch/*.hpp)
 $(CU_OBJS): $(CPU_SWITCH_HEADERS)
-$(OUT_DIR)/nccl.cu.o: $(LITE_COLL_DIR)/cpu_staging_channel.hpp $(LITE_COLL_DIR)/gpu_staging_channel.hpp
+GPU_DRIVEN_HEADERS := $(wildcard $(GPU_DRIVEN_DIR)/*.cuh) $(wildcard $(GPU_DRIVEN_DIR)/*.hpp)
+$(OUT_DIR)/nccl.cu.o: $(LITE_COLL_DIR)/cpu_staging_channel.hpp $(LITE_COLL_DIR)/gpu_staging_channel.hpp $(LITE_COLL_DIR)/node_exchange_buffer.hpp $(GPU_DRIVEN_HEADERS)
 $(OUT_DIR)/$(LITE_COLL_DIR)/allgather_multinode.cu.o: lite_common.h
+$(OUT_DIR)/$(GPU_DRIVEN_DIR)/network_service.cu.o: lite_common.h $(GPU_DRIVEN_HEADERS) $(LITE_COLL_DIR)/node_exchange_buffer.hpp
 
 $(OUT_DIR)/$(LITE_COLL_DIR)/allgather_multinode.cu.o: $(LITE_COLL_DIR)/allgather_multinode.cu $(LITE_COLL_DIR)/node_exchange_buffer.hpp | $(OUT_DIR)
 	mkdir -p $(@D)
@@ -84,6 +103,15 @@ $(AUDIT_OBJ): audit_nccl.cc | $(OUT_DIR)
 
 $(LIB_AUDIT_SO): $(AUDIT_OBJ)
 	$(CXX) -shared -o $@ $^
+
+device-collectives-bench: $(OUT_DIR)/device_collectives_bench
+
+$(OUT_DIR)/device_collectives_bench.o: $(GPU_DRIVEN_DIR)/device_collectives_bench.cu $(GPU_DRIVEN_HEADERS) | $(OUT_DIR)
+	$(NVCC) $(CUFLAGS) -lineinfo $(NVCC_GENCODE) -ccbin $(MPI_CXX) $(INCLUDES) $(DEFINES) -c $< -o $@
+
+$(OUT_DIR)/device_collectives_bench: $(OUT_DIR)/device_collectives_bench.o $(LIB_NCCL_SO)
+	$(NVCC) -ccbin $(MPI_CXX) -o $@ $< -L$(OUT_DIR) $(LDFLAGS) \
+		-Xlinker -rpath -Xlinker '$$ORIGIN' -lmscclpp_nccl $(NVCC_LDLIBS)
 
 clean:
 	rm -rf $(OUT_DIR)

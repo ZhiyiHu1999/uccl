@@ -1,3 +1,12 @@
+# Build in parallel by default (the CUDA translation units dominate build time).
+# Only the top-level make sets it, and not when the caller already passed -j.
+# JOBS=N overrides the job count (capped at 16 by default, nvcc needs memory);
+# JOBS=1 builds serially.
+JOBS ?= $(shell n=$$(nproc 2>/dev/null || echo 4); [ $$n -gt 16 ] && n=16; echo $$n)
+ifeq ($(MAKELEVEL)$(findstring -j,$(MAKEFLAGS)),0)
+MAKEFLAGS += -j$(JOBS)
+endif
+
 CXX       ?= g++
 NVCC      ?= nvcc
 AR        ?= ar

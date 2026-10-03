@@ -1,0 +1,2292 @@
+// GPU-driven private transport implementation, based on the CPU reference.
+// Native CPU AllGather is compiled separately and never calls this file.
+#include "native_collectives.hpp"
+#include "lite_common.h"
+#include "debug.h"
+#include "lite/node_exchange_buffer.hpp"
+#include "lite/gpu_driven/network_service.hpp"
+#include "lite/cpu_switch/cpu_switch.hpp"
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <condition_variable>
+#include <cstdio>
+#include <cstring>
+#include <cstdint>
+#include <cstddef>
+#include <exception>
+#include <fstream>
+#include <limits>
+#include <mutex>
+#include <new>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+#include <cuda_runtime.h>
+#include <fcntl.h>
+#include <numa.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+namespace mscclpp {
+namespace nccl {
+namespace {
+
+// Multi-node AllGather is deliberately host-memory based.  Do not route it
+// through the generic grouped P2P send/recv path: on this no-GDR testbed NCCL
+// also stages through host memory, so the win comes from explicit host slots,
+// contiguous slabs, and topology-specific overlap.
+//
+// Dispatch sketch:
+// - tiny two-node rows: ordered host slots (`runSmallOrdered`);
+// - 2nx1g large rows: one-rank 512KiB chunk pipeline (`runSingleSlab` delegates);
+// - 2nx2g: single host slab with 512KiB chunks;
+// - 2nx4g: NUMA/NIC split slabs when the local GPU layout is symmetric.
+
+
+static constexpr int kHostTagBase = 0x560000;
+static constexpr int kHostTagStride = 6;
+static constexpr int kNumaTagBase = 0x565000;
+static constexpr int kGpuDirectTagBase = 0x568000;
+static constexpr int kGpuDirectTagStride = 1;
+static constexpr int kMaxRanksPerNode = 8;
+static constexpr int kMaxNodes = 16;
+static constexpr int kMaxNicGroups = kMaxRanksPerNode;
+static constexpr size_t kSmallCutoffBytes = 128 * 1024;
+static constexpr size_t kTwoGpuSmallCutoffBytes = 128 * 1024;
+static constexpr size_t kOneRankSmallCutoffBytes = 2 * 1024 * 1024;
+static constexpr size_t kOneRankDirectCopyCutoffBytes = 128 * 1024;
+static constexpr size_t kOneRankMappedOutputCutoffBytes = 64 * 1024;
+static constexpr size_t kSmallMaxSlots = 1024;
+static constexpr int kSmallSignalEvery = 256;
+static constexpr size_t kMaxBytesPerRank = 16 * 1024 * 1024;
+// The 2nx1g pipeline stages a full message per slot, so size its slabs to
+// cover the largest optimized benchmark point instead of falling back at 16MiB.
+static constexpr size_t kOneRankMaxBytesPerRank = 1024ULL * 1024 * 1024;
+static constexpr size_t kDefaultPipelineChunkBytes = 2 * 1024 * 1024;
+static constexpr size_t kTwoGpuPipelineChunkBytes = 512 * 1024;
+static constexpr size_t kOneRankPipelineChunkBytes = 512 * 1024;
+static constexpr size_t kOneRankPipelineMaxBytes = 1024ULL * 1024 * 1024;
+static constexpr size_t kOneRankPipelineSendWindow = 1;
+static constexpr size_t kRdmaChunkBytes = 2 * 1024 * 1024;
+static constexpr size_t kDualRailMinBytes = 2 * 1024 * 1024;
+static constexpr size_t kDirectSelfCopyMinBytes = 512 * 1024;
+static constexpr int kSignalEveryN = 256;
+static constexpr int kPollSpinsBeforeYield = 65536;
+static constexpr uint64_t kPipeValueStride =
+    (kOneRankPipelineMaxBytes + kOneRankPipelineChunkBytes - 1) /
+    kOneRankPipelineChunkBytes;
+static constexpr bool kEnableOneRankGpuDirect = false;
+
+using mscclpp::lite::createOwnedShm;
+using mscclpp::lite::cudaResult;
+using mscclpp::lite::getAvailableIBTransports;
+using mscclpp::lite::InitGuard;
+using mscclpp::lite::mapException;
+using mscclpp::lite::mapShm;
+using mscclpp::lite::placeOnNuma;
+using mscclpp::lite::publishInitStatus;
+using mscclpp::lite::selectIBTransportForGpu;
+// Device-service waits observe cancellation so a timed-out caller cannot
+// strand its service worker. This translation unit has no native CPU entry.
+thread_local LiteNetworkControl* activeDeviceCall = nullptr;
+void checkDeviceAllGatherAbort() {
+  if (activeDeviceCall && __atomic_load_n(&activeDeviceCall->abort, __ATOMIC_ACQUIRE))
+    throw mscclpp::Error("device AllGather aborted", mscclpp::ErrorCode::SystemError);
+}
+void waitForEpoch(std::atomic<uint64_t> const& value, uint64_t epoch) {
+  if (!activeDeviceCall) return mscclpp::lite::waitForEpoch(value, epoch);
+  int spins = 0;
+  for (;;) {
+    checkDeviceAllGatherAbort();
+    uint64_t observed = value.load(std::memory_order_acquire);
+    if (observed == UINT64_MAX)
+      throw mscclpp::Error("device AllGather peer failed", mscclpp::ErrorCode::SystemError);
+    if (observed >= epoch) return;
+    if (spins++ < kPollSpinsBeforeYield) {
+      asm volatile("pause" ::: "memory");
+    } else {
+      std::this_thread::yield();
+    }
+  }
+}
+
+struct HostControl {
+  alignas(64) std::atomic<uint64_t>
+      d2hReady[kMaxRanksPerNode];
+  alignas(64) std::atomic<uint64_t> rdmaReady[kMaxNodes];
+  alignas(64) std::atomic<uint64_t> rdmaSignal[kMaxNodes];
+  alignas(64) std::atomic<uint64_t>
+      h2dDone[kMaxRanksPerNode];
+  alignas(64) std::atomic<uint64_t> ackReady[kMaxNodes];
+  alignas(64) std::atomic<uint64_t> ackSignal[kMaxNodes];
+  alignas(64) std::atomic<uint64_t> pipeReady[kMaxNodes];
+};
+
+struct HostNames {
+  char sendName[96] = {};
+  char recvName[96] = {};
+  char ctrlName[96] = {};
+};
+
+struct AgContext {
+  bool initialized = false;
+  bool initializing = false;
+  bool owner = false;
+  bool isLeader = false;
+  int rank = -1;
+  int worldSize = -1;
+  int nRanksPerNode = -1;
+  int nodeCount = -1;
+  int localRank = -1;
+  int nodeId = -1;
+  int localLeader = -1;
+  int remoteLeader = -1;
+  int cudaDevice = -1;
+  int transportDevice = -1;
+  int numaNode = -1;
+  int groupId = 0;
+  int groupBase = 0;
+  int groupSize = 0;
+  bool numaSplit = false;
+  size_t chunkCapacity = kMaxBytesPerRank;
+  size_t slabBytes = 0;
+  uint64_t epoch = 0;
+  size_t smallPerSlotBytes = 0;
+
+  // NodeExchangeBuffer owns sendSlab + recvSlab lifecycle.
+  std::unique_ptr<NodeExchangeBuffer> exchBuf;
+  std::string ctrlName;
+  void* ctrlMapping = nullptr;
+  // Raw aliases into exchBuf's slabs (kept for compatibility with GPU-kernel
+  // paths and RDMA registration that reference these pointers directly).
+  char* sendSlab = nullptr;
+  char* recvSlab = nullptr;
+  HostControl* ctrl = nullptr;
+  char const* sendDeviceSlab = nullptr;
+  char* ctrlDeviceSlab = nullptr;
+  bool ctrlHostRegistered = false;
+
+  mscclpp::Transport transport = mscclpp::Transport::Unknown;
+  mscclpp::RegisteredMemory sendMemory;
+  mscclpp::RegisteredMemory recvMemory;
+  mscclpp::RegisteredMemory ctrlMemory;
+  mscclpp::RegisteredMemory remoteSendMemory;
+  mscclpp::RegisteredMemory remoteRecvMemory;
+  mscclpp::RegisteredMemory remoteCtrlMemory;
+  mscclpp::Connection connection;
+  mscclpp::Transport rail2Transport = mscclpp::Transport::Unknown;
+  mscclpp::RegisteredMemory rail2SendMemory;
+  mscclpp::RegisteredMemory rail2RecvMemory;
+  mscclpp::RegisteredMemory rail2RemoteRecvMemory;
+  mscclpp::Connection rail2Connection;
+  std::vector<int> peerNodeIds;
+  std::vector<int> peerLeaders;
+  std::vector<mscclpp::Connection> peerConnections;
+  std::vector<mscclpp::RegisteredMemory> peerRemoteRecvMemory;
+  std::vector<mscclpp::RegisteredMemory> peerRemoteCtrlMemory;
+  std::shared_ptr<mscclpp::IbQp> smallQp;
+  mscclpp::IbMr const* smallSendMr = nullptr;
+  mscclpp::IbMr const* smallCtrlMr = nullptr;
+  mscclpp::IbMrInfo smallRemoteSendMrInfo{};
+  mscclpp::IbMrInfo smallRemoteRecvMrInfo{};
+  mscclpp::IbMrInfo smallRemoteCtrlMrInfo{};
+  int smallWrCount = 0;
+  std::array<uint64_t, kMaxNodes> rdmaReadyAtomicEpoch{};
+  void const* gdrSendPtr = nullptr;
+  size_t gdrSendBytes = 0;
+  mscclpp::RegisteredMemory gdrSendMemory;
+  mscclpp::IbMr const* gdrSendMr = nullptr;
+  void* gdrRecvPtr = nullptr;
+  size_t gdrRecvBytes = 0;
+  mscclpp::RegisteredMemory gdrRecvMemory;
+  mscclpp::RegisteredMemory gdrRemoteRecvMemory;
+  mscclpp::IbMrInfo gdrRemoteRecvMrInfo{};
+  bool gdrRemoteRecvValid = false;
+  bool gdrDisabled = false;
+  cudaStream_t d2hStream = nullptr;
+  cudaStream_t h2dStream = nullptr;
+  cudaEvent_t inputReadyEvent = nullptr;
+  cudaEvent_t h2dDoneEvent = nullptr;
+  std::vector<cudaEvent_t> h2dSlotEvents;
+  std::vector<cudaEvent_t> d2hChunkEvents;
+  std::mutex initMutex;
+  std::condition_variable initCv;
+  std::exception_ptr initException = nullptr;
+
+  ~AgContext() {
+    smallQp.reset();
+    smallSendMr = nullptr;
+    smallCtrlMr = nullptr;
+    if (inputReadyEvent) cudaEventDestroy(inputReadyEvent);
+    if (h2dDoneEvent) cudaEventDestroy(h2dDoneEvent);
+    for (auto event : h2dSlotEvents) {
+      if (event) cudaEventDestroy(event);
+    }
+    for (auto event : d2hChunkEvents) {
+      if (event) cudaEventDestroy(event);
+    }
+    if (d2hStream) cudaStreamDestroy(d2hStream);
+    if (h2dStream) cudaStreamDestroy(h2dStream);
+    connection = mscclpp::Connection{};
+    rail2Connection = mscclpp::Connection{};
+    rail2RemoteRecvMemory = mscclpp::RegisteredMemory{};
+    rail2RecvMemory = mscclpp::RegisteredMemory{};
+    rail2SendMemory = mscclpp::RegisteredMemory{};
+    remoteCtrlMemory = mscclpp::RegisteredMemory{};
+    remoteRecvMemory = mscclpp::RegisteredMemory{};
+    remoteSendMemory = mscclpp::RegisteredMemory{};
+    ctrlMemory = mscclpp::RegisteredMemory{};
+    recvMemory = mscclpp::RegisteredMemory{};
+    sendMemory = mscclpp::RegisteredMemory{};
+    // exchBuf destructor handles sendSlab + recvSlab cleanup.
+    exchBuf.reset();
+    if (ctrlHostRegistered) cudaHostUnregister(ctrlMapping);
+    if (ctrlMapping) munmap(ctrlMapping, sizeof(HostControl));
+    if (owner) {
+      if (!ctrlName.empty()) shm_unlink(ctrlName.c_str());
+    }
+  }
+};
+
+struct NicGroupLayout {
+  int count = 0;
+  std::array<int, kMaxNicGroups> base = {};
+  std::array<int, kMaxNicGroups> size = {};
+  std::array<int, kMaxNicGroups> transportDevice = {};
+};
+
+std::mutex gAllGatherContextMutex;
+std::unordered_map<ncclComm_t, std::unique_ptr<AgContext>>
+    gSingleContexts;
+std::unordered_map<
+    ncclComm_t,
+    std::array<std::unique_ptr<AgContext>,
+               kMaxNicGroups>>
+    gNumaContexts;
+std::unordered_map<ncclComm_t, std::vector<int>> gCudaDevicesByComm;
+std::unordered_map<ncclComm_t, NicGroupLayout> gLayoutByComm;
+
+__device__ unsigned long long volatile* ctrlU64(char* ctrl, size_t offset) {
+  return reinterpret_cast<unsigned long long volatile*>(ctrl + offset);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+int hostTag(int rank, int worldSize, int remoteLeader,
+                           int slot) {
+  int lo = std::min(rank, remoteLeader);
+  int hi = std::max(rank, remoteLeader);
+  int pairIndex = lo * worldSize + hi;
+  return kHostTagBase +
+         pairIndex * kHostTagStride + slot;
+}
+
+int numaTag(int rank, int worldSize, int remoteLeader,
+                               int slot) {
+  int lo = std::min(rank, remoteLeader);
+  int hi = std::max(rank, remoteLeader);
+  int pairIndex = lo * worldSize + hi;
+  return kNumaTagBase +
+         pairIndex * kHostTagStride + slot;
+}
+
+int gpuDirectTag(int rank, int worldSize, int remoteLeader, int slot) {
+  int lo = std::min(rank, remoteLeader);
+  int hi = std::max(rank, remoteLeader);
+  int pairIndex = lo * worldSize + hi;
+  return kGpuDirectTagBase + pairIndex * kGpuDirectTagStride + slot;
+}
+
+void unlinkOwnedShm(HostNames const& names) {
+  if (names.sendName[0] != '\0') shm_unlink(names.sendName);
+  if (names.recvName[0] != '\0') shm_unlink(names.recvName);
+  if (names.ctrlName[0] != '\0') shm_unlink(names.ctrlName);
+}
+
+void waitForSlotReady(char const* flagPtr, uint64_t epoch) {
+  auto const* value = reinterpret_cast<uint64_t const volatile*>(flagPtr);
+  int spins = 0;
+  while (*value != epoch) {
+    checkDeviceAllGatherAbort();
+    if (activeDeviceCall && *value == UINT64_MAX)
+      throw mscclpp::Error("device AllGather peer failed", mscclpp::ErrorCode::SystemError);
+    if (spins++ < kPollSpinsBeforeYield) {
+      asm volatile("pause" ::: "memory");
+    } else {
+      std::this_thread::yield();
+    }
+  }
+  std::atomic_thread_fence(std::memory_order_acquire);
+}
+
+void waitForCudaStream(cudaStream_t stream) {
+  int spins = 0;
+  while (true) {
+    checkDeviceAllGatherAbort();
+    cudaError_t result = cudaStreamQuery(stream);
+    if (result == cudaSuccess) return;
+    if (result != cudaErrorNotReady) MSCCLPP_CUDATHROW(result);
+    if (spins++ < kPollSpinsBeforeYield) {
+      asm volatile("pause" ::: "memory");
+    } else {
+      std::this_thread::yield();
+    }
+  }
+}
+
+void waitForCudaEvent(cudaEvent_t event) {
+  int spins = 0;
+  while (true) {
+    checkDeviceAllGatherAbort();
+    cudaError_t result = cudaEventQuery(event);
+    if (result == cudaSuccess) return;
+    if (result != cudaErrorNotReady) MSCCLPP_CUDATHROW(result);
+    if (spins++ < kPollSpinsBeforeYield) {
+      asm volatile("pause" ::: "memory");
+    } else {
+      std::this_thread::yield();
+    }
+  }
+}
+
+void ensurePipelineStreams(AgContext& ctx) {
+  if (ctx.d2hStream == nullptr) {
+    MSCCLPP_CUDATHROW(cudaStreamCreateWithFlags(&ctx.d2hStream,
+                                                cudaStreamNonBlocking));
+  }
+  if (ctx.h2dStream == nullptr) {
+    MSCCLPP_CUDATHROW(cudaStreamCreateWithFlags(&ctx.h2dStream,
+                                                cudaStreamNonBlocking));
+  }
+  if (ctx.inputReadyEvent == nullptr) {
+    MSCCLPP_CUDATHROW(cudaEventCreateWithFlags(&ctx.inputReadyEvent,
+                                               cudaEventDisableTiming));
+  }
+  if (ctx.h2dDoneEvent == nullptr) {
+    MSCCLPP_CUDATHROW(cudaEventCreateWithFlags(&ctx.h2dDoneEvent,
+                                               cudaEventDisableTiming));
+  }
+}
+
+void ensureSlotEvents(AgContext& ctx, size_t slotCount) {
+  while (ctx.h2dSlotEvents.size() < slotCount) {
+    cudaEvent_t event = nullptr;
+    MSCCLPP_CUDATHROW(
+        cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    ctx.h2dSlotEvents.push_back(event);
+  }
+}
+
+void ensureD2hChunkEvents(AgContext& ctx, size_t chunkCount) {
+  while (ctx.d2hChunkEvents.size() < chunkCount) {
+    cudaEvent_t event = nullptr;
+    MSCCLPP_CUDATHROW(
+        cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    ctx.d2hChunkEvents.push_back(event);
+  }
+}
+
+size_t ctrlArrayOffset(size_t baseOffset, int nodeId) {
+  return baseOffset + static_cast<size_t>(nodeId) *
+                          sizeof(std::atomic<uint64_t>);
+}
+
+size_t d2hReadyOffset(int localRank) {
+  return ctrlArrayOffset(offsetof(HostControl, d2hReady), localRank);
+}
+
+size_t rdmaReadyOffset(int nodeId) {
+  return ctrlArrayOffset(offsetof(HostControl, rdmaReady), nodeId);
+}
+
+size_t rdmaSignalOffset(int nodeId) {
+  return ctrlArrayOffset(offsetof(HostControl, rdmaSignal), nodeId);
+}
+
+size_t ackReadyOffset(int nodeId) {
+  return ctrlArrayOffset(offsetof(HostControl, ackReady), nodeId);
+}
+
+size_t ackSignalOffset(int nodeId) {
+  return ctrlArrayOffset(offsetof(HostControl, ackSignal), nodeId);
+}
+
+size_t pipeReadyOffset(int nodeId) {
+  return ctrlArrayOffset(offsetof(HostControl, pipeReady), nodeId);
+}
+
+void pollQp(AgContext& ctx) {
+  if (!ctx.smallQp) return;
+  while (ctx.smallQp->getNumSendCqItems() > 0) {
+    checkDeviceAllGatherAbort();
+    int wcNum = ctx.smallQp->pollSendCq();
+    if (wcNum < 0) {
+      throw mscclpp::Error("small allgather pollSendCq failed",
+                           mscclpp::ErrorCode::SystemError);
+    }
+    for (int i = 0; i < wcNum; ++i) {
+      if (ctx.smallQp->getSendWcStatus(i) != 0) {
+        throw mscclpp::Error("small allgather RDMA write failed: " +
+                                 ctx.smallQp->getSendWcStatusString(i),
+                             mscclpp::ErrorCode::SystemError);
+      }
+    }
+  }
+}
+
+void signalRdmaReadyAtomic(AgContext& ctx,
+                           mscclpp::Connection& connection,
+                           mscclpp::RegisteredMemory remoteCtrlMemory,
+                           int peerNode, uint64_t epoch) {
+  uint64_t& publishedEpoch = ctx.rdmaReadyAtomicEpoch[peerNode];
+  mscclpp::lite::CpuSwitch<char>{}.rdmaSignal(
+      connection,
+      remoteCtrlMemory,
+      rdmaReadyOffset(ctx.nodeId),
+      &publishedEpoch,
+      epoch);
+  mscclpp::lite::CpuSwitch<char>{}.rdmaFlush(connection);
+}
+
+void signalRdmaReadyAtomic(AgContext& ctx, size_t peer, uint64_t epoch) {
+  signalRdmaReadyAtomic(ctx, ctx.peerConnections[peer],
+                        ctx.peerRemoteCtrlMemory[peer],
+                        ctx.peerNodeIds[peer], epoch);
+}
+
+void writeOrderedSlot(AgContext& ctx, size_t dataOffset, size_t flagOffset,
+                       size_t dataBytes) {
+  size_t flagSrcOffset = rdmaSignalOffset(ctx.nodeId);
+  if (!ctx.smallQp || ctx.smallSendMr == nullptr || ctx.smallCtrlMr == nullptr) {
+    mscclpp::lite::CpuSwitch<char> cpuSwitch;
+    cpuSwitch.rdmaWrite(
+        ctx.connection,
+        ctx.remoteSendMemory,
+        dataOffset,
+        ctx.sendMemory,
+        dataOffset,
+        dataBytes);
+    cpuSwitch.rdmaWriteAndFlush(
+        ctx.connection,
+        ctx.remoteSendMemory,
+        flagOffset,
+        ctx.ctrlMemory,
+        flagSrcOffset,
+        sizeof(uint64_t));
+    return;
+  }
+  bool signaled = (++ctx.smallWrCount % kSmallSignalEvery) == 0;
+  ctx.smallQp->stageSendWrite(ctx.smallSendMr, ctx.smallRemoteSendMrInfo,
+                              static_cast<uint32_t>(dataBytes), /*wrId=*/0,
+                              dataOffset, dataOffset, false);
+  ctx.smallQp->stageSendWrite(ctx.smallCtrlMr, ctx.smallRemoteSendMrInfo,
+                              sizeof(uint64_t), /*wrId=*/0, flagSrcOffset,
+                              flagOffset, signaled);
+  ctx.smallQp->postSend();
+  if (signaled) pollQp(ctx);
+}
+
+void writeCompactSlot(AgContext& ctx, size_t segmentOffset,
+                      size_t segmentBytes) {
+  if (!ctx.smallQp || ctx.smallSendMr == nullptr) {
+    mscclpp::lite::CpuSwitch<char>{}.rdmaWriteAndFlush(
+        ctx.connection,
+        ctx.remoteSendMemory,
+        segmentOffset,
+        ctx.sendMemory,
+        segmentOffset,
+        segmentBytes);
+    return;
+  }
+  bool signaled = (++ctx.smallWrCount % kSmallSignalEvery) == 0;
+  ctx.smallQp->stageSendWrite(ctx.smallSendMr, ctx.smallRemoteSendMrInfo,
+                              static_cast<uint32_t>(segmentBytes), /*wrId=*/0,
+                              segmentOffset, segmentOffset, signaled);
+  ctx.smallQp->postSend();
+  if (signaled) pollQp(ctx);
+}
+
+bool writeDataDirectToRemoteRecv(AgContext& ctx, size_t remoteBase,
+                                 size_t sendBase, size_t blockBytes) {
+  if (!ctx.smallQp || ctx.smallSendMr == nullptr) return false;
+  size_t off = 0;
+  while (off < blockBytes) {
+    size_t chunk = std::min(kRdmaChunkBytes, blockBytes - off);
+    ctx.smallQp->stageSendWrite(ctx.smallSendMr, ctx.smallRemoteRecvMrInfo,
+                                static_cast<uint32_t>(chunk), /*wrId=*/0,
+                                sendBase + off, remoteBase + off,
+                                /*signaled=*/false);
+    off += chunk;
+  }
+  ctx.smallQp->postSend();
+  return true;
+}
+
+bool writeDataStripedToRemoteRecv(AgContext& ctx, size_t remoteBase,
+                                  size_t sendBase, size_t blockBytes) {
+  if (ctx.rail2Transport == mscclpp::Transport::Unknown ||
+      blockBytes < kDualRailMinBytes) {
+    return false;
+  }
+  size_t rail1Bytes = blockBytes / 2;
+  size_t rail2Bytes = blockBytes - rail1Bytes;
+  if (rail1Bytes == 0 || rail2Bytes == 0) return false;
+
+  if (!writeDataDirectToRemoteRecv(ctx, remoteBase, sendBase, rail1Bytes)) {
+    return false;
+  }
+  mscclpp::lite::CpuSwitch<char>{}.rdmaWriteAndFlush(
+      ctx.rail2Connection,
+      ctx.rail2RemoteRecvMemory,
+      remoteBase + rail1Bytes,
+      ctx.rail2SendMemory,
+      sendBase + rail1Bytes,
+      rail2Bytes);
+  return true;
+}
+
+bool writePipelineChunkDirect(AgContext& ctx, size_t remoteBase,
+                              size_t sendBase, size_t bytes,
+                              size_t flagSrcOffset) {
+  if (!ctx.smallQp || ctx.smallSendMr == nullptr) {
+    return false;
+  }
+  bool signaled = (++ctx.smallWrCount % kSmallSignalEvery) == 0;
+  ctx.smallQp->stageSendWrite(ctx.smallSendMr, ctx.smallRemoteRecvMrInfo,
+                              static_cast<uint32_t>(bytes), /*wrId=*/0,
+                              sendBase, remoteBase, false);
+  ctx.smallQp->stageSendWrite(ctx.smallSendMr, ctx.smallRemoteCtrlMrInfo,
+                              sizeof(uint64_t), /*wrId=*/0,
+                              flagSrcOffset,
+                              pipeReadyOffset(ctx.nodeId), signaled);
+  ctx.smallQp->postSend();
+  if (signaled) pollQp(ctx);
+  return true;
+}
+
+bool ensureGpuDirectOneRank(
+    AgContext& ctx, std::shared_ptr<Communicator> bootstrapComm,
+    void const* sendbuff, size_t bytesPerRank, void* recvbuff,
+    size_t fullBytes) {
+  if (ctx.gdrDisabled || ctx.nodeCount != 2 || ctx.nRanksPerNode != 1 ||
+      !ctx.smallQp || ctx.smallCtrlMr == nullptr) {
+    return false;
+  }
+  try {
+    mscclpp::TransportFlags flags(ctx.transport);
+    if (ctx.gdrSendPtr != sendbuff || bytesPerRank > ctx.gdrSendBytes) {
+      ctx.gdrSendMemory = bootstrapComm->registerMemory(
+          const_cast<void*>(sendbuff), bytesPerRank, flags);
+      ctx.gdrSendMemory.getIbMrInfo(ctx.transport, &ctx.gdrSendMr, nullptr);
+      ctx.gdrSendPtr = sendbuff;
+      ctx.gdrSendBytes = bytesPerRank;
+    }
+    if (ctx.gdrRecvPtr != recvbuff || fullBytes > ctx.gdrRecvBytes) {
+      ctx.gdrRecvMemory =
+          bootstrapComm->registerMemory(recvbuff, fullBytes, flags);
+      ctx.gdrRecvPtr = recvbuff;
+      ctx.gdrRecvBytes = fullBytes;
+      int tag = gpuDirectTag(ctx.rank, ctx.worldSize, ctx.remoteLeader, 0);
+      bootstrapComm->sendMemory(ctx.gdrRecvMemory, ctx.remoteLeader, tag);
+      auto remoteFuture = bootstrapComm->recvMemory(ctx.remoteLeader, tag);
+      ctx.gdrRemoteRecvMemory = remoteFuture.get();
+      ctx.gdrRemoteRecvMemory.getIbMrInfo(ctx.transport, nullptr,
+                                          &ctx.gdrRemoteRecvMrInfo);
+      ctx.gdrRemoteRecvValid = true;
+    }
+  } catch (std::exception const& ex) {
+    WARN("AllGather GPUDirect path disabled: %s", ex.what());
+    ctx.gdrDisabled = true;
+    ctx.gdrSendMr = nullptr;
+    ctx.gdrRemoteRecvValid = false;
+    return false;
+  }
+  return ctx.gdrSendMr != nullptr && ctx.gdrRemoteRecvValid;
+}
+
+bool writeGpuDirectOneRank(AgContext& ctx, size_t bytesPerRank,
+                           uint64_t epoch) {
+  if (!ctx.smallQp || ctx.gdrSendMr == nullptr ||
+      ctx.smallCtrlMr == nullptr || !ctx.gdrRemoteRecvValid) {
+    return false;
+  }
+  ctx.ctrl->rdmaSignal[ctx.nodeId].store(epoch, std::memory_order_release);
+  size_t dstOffset = static_cast<size_t>(ctx.rank) * bytesPerRank;
+  ctx.smallQp->stageSendWrite(ctx.gdrSendMr, ctx.gdrRemoteRecvMrInfo,
+                              static_cast<uint32_t>(bytesPerRank), /*wrId=*/0,
+                              /*srcOffset=*/0, dstOffset, false);
+  ctx.smallQp->postSend();
+  signalRdmaReadyAtomic(ctx, ctx.connection, ctx.remoteCtrlMemory,
+                        1 - ctx.nodeId, epoch);
+  return true;
+}
+
+template <typename SlotGetter>
+AgContext& getContext(
+    SlotGetter&& slotGetter, ncclComm_t commHandle,
+    std::shared_ptr<Communicator> bootstrapComm, int rank, int nRanks,
+    int nRanksPerNode, int cudaDevice, int groupId, int groupBase,
+    int groupSize, int transportDevice, bool numaSplit, char const* opName) {
+  AgContext* ctx = nullptr;
+  bool shouldInitialize = false;
+  {
+    std::lock_guard<std::mutex> lock(gAllGatherContextMutex);
+    auto& existing = slotGetter();
+    if (!existing) {
+      existing = std::make_unique<AgContext>();
+      existing->initializing = true;
+      shouldInitialize = true;
+    }
+    ctx = existing.get();
+  }
+  {
+    std::unique_lock<std::mutex> initLock(ctx->initMutex);
+    if (ctx->initialized) return *ctx;
+    if (!shouldInitialize) {
+      ctx->initCv.wait(initLock,
+                       [&] { return ctx->initialized || !ctx->initializing; });
+      if (ctx->initialized) return *ctx;
+      if (ctx->initException) std::rethrow_exception(ctx->initException);
+      throw mscclpp::Error("AllGather context initialization failed",
+                           mscclpp::ErrorCode::InternalError);
+    }
+  }
+  InitGuard<AgContext> initGuard(ctx);
+
+  ctx->rank = rank;
+  ctx->worldSize = nRanks;
+  ctx->nRanksPerNode = nRanksPerNode;
+  ctx->nodeCount = nRanks / nRanksPerNode;
+  if (ctx->nodeCount <= 0 || ctx->nodeCount > kMaxNodes) {
+    throw mscclpp::Error("AllGather node count exceeds host-control capacity",
+                         mscclpp::ErrorCode::InvalidUsage);
+  }
+  ctx->localRank = rank % nRanksPerNode;
+  ctx->nodeId = rank / nRanksPerNode;
+  ctx->localLeader = ctx->nodeId * nRanksPerNode + groupBase;
+  ctx->remoteLeader =
+      ctx->nodeCount == 2 ? (1 - ctx->nodeId) * nRanksPerNode + groupBase : -1;
+  ctx->cudaDevice = cudaDevice;
+  ctx->transportDevice = transportDevice;
+  ctx->groupId = groupId;
+  ctx->groupBase = groupBase;
+  ctx->groupSize = groupSize;
+  ctx->numaSplit = numaSplit;
+  // 2nx1g uses one full-message slot so it can keep the one-rank chunk
+  // pipeline active through 1GiB instead of falling back to generic slabs.
+  // Other layouts keep the compact 16MiB slab capacity.
+  if (!numaSplit && ctx->nodeCount == 2 && nRanksPerNode == 1) {
+    ctx->chunkCapacity = kOneRankMaxBytesPerRank;
+  }
+  try {
+    ctx->numaNode = mscclpp::getDeviceNumaNode(transportDevice);
+  } catch (...) {
+    ctx->numaNode = -1;
+  }
+  ctx->isLeader = rank == ctx->localLeader;
+  ctx->owner = ctx->isLeader;
+  ctx->slabBytes = static_cast<size_t>(ctx->nodeCount) *
+                   static_cast<size_t>(groupSize) * ctx->chunkCapacity;
+  ctx->peerNodeIds.clear();
+  ctx->peerLeaders.clear();
+  for (int peerNode = 0; peerNode < ctx->nodeCount; ++peerNode) {
+    if (peerNode == ctx->nodeId) continue;
+    ctx->peerNodeIds.push_back(peerNode);
+    ctx->peerLeaders.push_back(peerNode * nRanksPerNode + groupBase);
+  }
+
+  // ── Create send/recv slabs via NodeExchangeBuffer ────────────────────────
+  {
+    auto commNonce = static_cast<unsigned long long>(
+        reinterpret_cast<uintptr_t>(commHandle));
+    char nameTag[128];
+    // Use localLeader rank in the name so each node's leader generates a
+    // unique name; remote nodes have their own leaders with different ranks.
+    std::snprintf(nameTag, sizeof(nameTag), "%llx_%d_%d_%d_g%d",
+                  commNonce, getpid(), ctx->localLeader, nRanks, groupId);
+    ctx->exchBuf = std::make_unique<NodeExchangeBuffer>(
+        NodeExchangeBuffer::create(bootstrapComm, rank, nRanks,
+                                   ctx->isLeader, ctx->localLeader,
+                                   ctx->slabBytes,
+                                   ctx->numaNode, cudaDevice, nameTag));
+    ctx->sendSlab       = ctx->exchBuf->sendPtr();
+    ctx->recvSlab       = ctx->exchBuf->recvPtr();
+    ctx->sendDeviceSlab = ctx->exchBuf->sendDevicePtr();
+  }
+
+  // ── Create HostControl (RDMA coordination flags) ──────────────────────────
+  HostNames localNames;
+  ncclResult_t shmCreateResult = ncclSuccess;
+  std::string shmCreateMessage;
+  try {
+    if (ctx->isLeader) {
+      auto commNonce = static_cast<unsigned long long>(
+          reinterpret_cast<uintptr_t>(commHandle));
+      std::snprintf(localNames.ctrlName, sizeof(localNames.ctrlName),
+                    "/mint_ag_%llx_%d_%d_%d_g%d_c", commNonce, getpid(), rank,
+                    nRanks, groupId);
+      createOwnedShm(localNames.ctrlName, sizeof(HostControl));
+    }
+  } catch (std::exception const& ex) {
+    shmCreateResult = mapException(ex);
+    shmCreateMessage = ex.what();
+  } catch (...) {
+    shmCreateResult = ncclInternalError;
+    shmCreateMessage = "unknown shared-memory create exception";
+  }
+  try {
+    std::string stage = std::string(opName) + " ctrl create";
+    publishInitStatus(bootstrapComm, rank, nRanks, shmCreateResult,
+                                shmCreateMessage, stage.c_str());
+  } catch (...) {
+    if (ctx->isLeader) unlinkOwnedShm(localNames);
+    throw;
+  }
+
+  std::vector<HostNames> allNames(nRanks);
+  allNames[rank] = localNames;
+  bootstrapComm->bootstrap()->allGather(allNames.data(), sizeof(HostNames));
+  HostNames const& leaderNames = allNames[ctx->localLeader];
+  ctx->ctrlName = leaderNames.ctrlName;
+
+  ncclResult_t shmMapResult = ncclSuccess;
+  std::string shmMapMessage;
+  try {
+    ctx->ctrlMapping = mapShm(ctx->ctrlName, sizeof(HostControl));
+    ctx->ctrl = static_cast<HostControl*>(ctx->ctrlMapping);
+    if (ctx->isLeader) {
+      std::memset(ctx->ctrlMapping, 0, sizeof(HostControl));
+      new (ctx->ctrl) HostControl{};
+    }
+  } catch (std::exception const& ex) {
+    shmMapResult = mapException(ex);
+    shmMapMessage = ex.what();
+  } catch (...) {
+    shmMapResult = ncclInternalError;
+    shmMapMessage = "unknown shared-memory map exception";
+  }
+  std::string mapStage = std::string(opName) + " ctrl map";
+  publishInitStatus(bootstrapComm, rank, nRanks, shmMapResult,
+                              shmMapMessage, mapStage.c_str());
+  bootstrapComm->bootstrap()->barrier();
+
+  ncclResult_t setupResult = ncclSuccess;
+  std::string setupMessage;
+  try {
+    cudaError_t ctrlRegister = cudaHostRegister(
+        ctx->ctrlMapping, sizeof(HostControl),
+        cudaHostRegisterPortable | cudaHostRegisterMapped);
+    if (ctrlRegister == cudaSuccess) {
+      void* ctrlDeviceSlab = nullptr;
+      MSCCLPP_CUDATHROW(cudaHostGetDevicePointer(&ctrlDeviceSlab,
+                                                 ctx->ctrlMapping, 0));
+      ctx->ctrlDeviceSlab = static_cast<char*>(ctrlDeviceSlab);
+    } else {
+      cudaGetLastError();
+      MSCCLPP_CUDATHROW(cudaHostRegister(ctx->ctrlMapping,
+                                         sizeof(HostControl),
+                                         cudaHostRegisterPortable));
+      ctx->ctrlDeviceSlab = nullptr;
+    }
+    ctx->ctrlHostRegistered = true;
+
+    if (ctx->isLeader) {
+      ctx->transport = selectIBTransportForGpu(transportDevice);
+      if (ctx->transport == mscclpp::Transport::Unknown) {
+        throw mscclpp::Error("AllGather requires IB transport",
+                             mscclpp::ErrorCode::InvalidUsage);
+      }
+      mscclpp::TransportFlags transportFlags(ctx->transport);
+      ctx->sendMemory =
+          bootstrapComm->registerMemory(ctx->sendSlab, ctx->slabBytes,
+                                        transportFlags);
+      ctx->recvMemory =
+          bootstrapComm->registerMemory(ctx->recvSlab, ctx->slabBytes,
+                                        transportFlags);
+      ctx->ctrlMemory =
+          bootstrapComm->registerMemory(ctx->ctrlMapping,
+                                        sizeof(HostControl),
+                                        transportFlags);
+      if (!ctx->numaSplit && ctx->nodeCount == 2) {
+        for (auto transport : getAvailableIBTransports()) {
+          if (transport != ctx->transport) {
+            ctx->rail2Transport = transport;
+            break;
+          }
+        }
+        if (ctx->rail2Transport != mscclpp::Transport::Unknown) {
+          mscclpp::TransportFlags rail2Flags(ctx->rail2Transport);
+          ctx->rail2SendMemory =
+              bootstrapComm->registerMemory(ctx->sendSlab, ctx->slabBytes,
+                                            rail2Flags);
+          ctx->rail2RecvMemory =
+              bootstrapComm->registerMemory(ctx->recvSlab, ctx->slabBytes,
+                                            rail2Flags);
+        }
+      }
+    }
+  } catch (std::exception const& ex) {
+    setupResult = mapException(ex);
+    setupMessage = ex.what();
+  } catch (...) {
+    setupResult = ncclInternalError;
+    setupMessage = "unknown setup exception";
+  }
+  std::string setupStage = std::string(opName) + " setup";
+  publishInitStatus(bootstrapComm, rank, nRanks, setupResult,
+                              setupMessage, setupStage.c_str());
+
+  ncclResult_t connectResult = ncclSuccess;
+  std::string connectMessage;
+  try {
+    if (ctx->isLeader) {
+      mscclpp::EndpointConfig::Ib ibCfg;
+      ibCfg.maxCqPollNum = 128;
+      ibCfg.mode = mscclpp::EndpointConfig::Ib::Mode::Host;
+      mscclpp::EndpointConfig endpointConfig(
+          ctx->transport, mscclpp::Device(mscclpp::DeviceType::CPU),
+          /*maxWriteQueueSize=*/-1, ibCfg);
+      ctx->peerConnections.clear();
+      ctx->peerRemoteRecvMemory.clear();
+      ctx->peerRemoteCtrlMemory.clear();
+      for (size_t peerIndex = 0; peerIndex < ctx->peerNodeIds.size();
+           ++peerIndex) {
+        int peerNode = ctx->peerNodeIds[peerIndex];
+        int peerLeader = ctx->peerLeaders[peerIndex];
+        int tag0 = ctx->numaSplit
+                       ? numaTag(rank, nRanks, peerLeader, 0)
+                       : hostTag(rank, nRanks, peerLeader, 0);
+        int tag1 = ctx->numaSplit
+                       ? numaTag(rank, nRanks, peerLeader, 1)
+                       : hostTag(rank, nRanks, peerLeader, 1);
+        int tag2 = ctx->numaSplit
+                       ? numaTag(rank, nRanks, peerLeader, 2)
+                       : hostTag(rank, nRanks, peerLeader, 2);
+        int tag3 = ctx->numaSplit
+                       ? numaTag(rank, nRanks, peerLeader, 3)
+                       : hostTag(rank, nRanks, peerLeader, 3);
+        int tag4 = ctx->numaSplit
+                       ? numaTag(rank, nRanks, peerLeader, 4)
+                       : hostTag(rank, nRanks, peerLeader, 4);
+        int tag5 = ctx->numaSplit
+                       ? numaTag(rank, nRanks, peerLeader, 5)
+                       : hostTag(rank, nRanks, peerLeader, 5);
+        auto connectionFuture =
+            bootstrapComm->connect(endpointConfig, peerLeader, tag0);
+        bootstrapComm->sendMemory(ctx->sendMemory, peerLeader, tag3);
+        auto remoteSendFuture = bootstrapComm->recvMemory(peerLeader, tag3);
+        bootstrapComm->sendMemory(ctx->recvMemory, peerLeader, tag1);
+        auto remoteRecvFuture = bootstrapComm->recvMemory(peerLeader, tag1);
+        bootstrapComm->sendMemory(ctx->ctrlMemory, peerLeader, tag2);
+        auto remoteCtrlFuture = bootstrapComm->recvMemory(peerLeader, tag2);
+        mscclpp::Connection rail2Connection;
+        mscclpp::RegisteredMemory rail2RemoteRecvMemory;
+        if (ctx->rail2Transport != mscclpp::Transport::Unknown) {
+          mscclpp::EndpointConfig rail2EndpointConfig(
+              ctx->rail2Transport,
+              mscclpp::Device(mscclpp::DeviceType::CPU),
+              /*maxWriteQueueSize=*/-1, ibCfg);
+          auto rail2ConnectionFuture =
+              bootstrapComm->connect(rail2EndpointConfig, peerLeader, tag4);
+          bootstrapComm->sendMemory(ctx->rail2RecvMemory, peerLeader, tag5);
+          auto rail2RemoteRecvFuture =
+              bootstrapComm->recvMemory(peerLeader, tag5);
+          rail2Connection = rail2ConnectionFuture.get();
+          rail2RemoteRecvMemory = rail2RemoteRecvFuture.get();
+        }
+
+        auto connection = connectionFuture.get();
+        auto remoteSendMemory = remoteSendFuture.get();
+        auto remoteRecvMemory = remoteRecvFuture.get();
+        auto remoteCtrlMemory = remoteCtrlFuture.get();
+        if (peerLeader == ctx->remoteLeader) {
+          ctx->connection = connection;
+          ctx->remoteSendMemory = remoteSendMemory;
+          ctx->remoteRecvMemory = remoteRecvMemory;
+          ctx->remoteCtrlMemory = remoteCtrlMemory;
+          ctx->rail2Connection = rail2Connection;
+          ctx->rail2RemoteRecvMemory = rail2RemoteRecvMemory;
+          ctx->smallQp = ctx->connection.getIbQp();
+          if (ctx->smallQp) {
+            ctx->sendMemory.getIbMrInfo(ctx->transport, &ctx->smallSendMr,
+                                        nullptr);
+            ctx->ctrlMemory.getIbMrInfo(ctx->transport, &ctx->smallCtrlMr,
+                                        nullptr);
+            ctx->remoteSendMemory.getIbMrInfo(ctx->transport, nullptr,
+                                              &ctx->smallRemoteSendMrInfo);
+            ctx->remoteRecvMemory.getIbMrInfo(ctx->transport, nullptr,
+                                              &ctx->smallRemoteRecvMrInfo);
+            ctx->remoteCtrlMemory.getIbMrInfo(ctx->transport, nullptr,
+                                              &ctx->smallRemoteCtrlMrInfo);
+          }
+        }
+        ctx->peerConnections.push_back(connection);
+        ctx->peerRemoteRecvMemory.push_back(remoteRecvMemory);
+        ctx->peerRemoteCtrlMemory.push_back(remoteCtrlMemory);
+      }
+    }
+  } catch (std::exception const& ex) {
+    connectResult = mapException(ex);
+    connectMessage = ex.what();
+  } catch (...) {
+    connectResult = ncclInternalError;
+    connectMessage = "unknown connection exception";
+  }
+  std::string connectStage = std::string(opName) + " connect";
+  publishInitStatus(bootstrapComm, rank, nRanks, connectResult,
+                              connectMessage, connectStage.c_str());
+
+  initGuard.commit();
+  return *ctx;
+}
+
+AgContext& getSingleContext(
+    ncclComm_t commHandle, std::shared_ptr<Communicator> bootstrapComm,
+    int rank, int nRanks, int nRanksPerNode, int cudaDevice) {
+  return getContext(
+      [&]() -> std::unique_ptr<AgContext>& {
+        return gSingleContexts[commHandle];
+      },
+      commHandle, bootstrapComm, rank, nRanks, nRanksPerNode, cudaDevice,
+      /*groupId=*/0, /*groupBase=*/0, /*groupSize=*/nRanksPerNode,
+      /*transportDevice=*/cudaDevice, /*numaSplit=*/false,
+      "AllGather");
+}
+
+std::vector<int> getCudaDevices(ncclComm_t commHandle,
+                                std::shared_ptr<Communicator> bootstrapComm,
+                                int rank, int nRanks, int cudaDevice) {
+  {
+    std::lock_guard<std::mutex> lock(gAllGatherContextMutex);
+    auto it = gCudaDevicesByComm.find(commHandle);
+    if (it != gCudaDevicesByComm.end()) return it->second;
+  }
+
+  std::vector<int> devices(nRanks, -1);
+  devices[rank] = cudaDevice;
+  bootstrapComm->bootstrap()->allGather(devices.data(), sizeof(int));
+
+  {
+    std::lock_guard<std::mutex> lock(gAllGatherContextMutex);
+    return gCudaDevicesByComm.emplace(commHandle, std::move(devices))
+        .first->second;
+  }
+}
+
+NicGroupLayout getNicGroupLayout(ncclComm_t commHandle,
+                                 std::shared_ptr<Communicator> bootstrapComm,
+                                 int rank, int nRanks, int nRanksPerNode,
+                                 int cudaDevice) {
+  {
+    std::lock_guard<std::mutex> lock(gAllGatherContextMutex);
+    auto it = gLayoutByComm.find(commHandle);
+    if (it != gLayoutByComm.end()) return it->second;
+  }
+
+  NicGroupLayout layout;
+  auto cacheLayout = [&](NicGroupLayout const& computedLayout) {
+    std::lock_guard<std::mutex> lock(gAllGatherContextMutex);
+    return gLayoutByComm.emplace(commHandle, computedLayout).first->second;
+  };
+  if (nRanksPerNode <= 0 || nRanksPerNode > kMaxRanksPerNode) {
+    return cacheLayout(layout);
+  }
+
+  auto devices =
+      getCudaDevices(commHandle, bootstrapComm, rank, nRanks, cudaDevice);
+  int hcaCount = static_cast<int>(getAvailableIBTransports().size());
+  if (hcaCount <= 0) return cacheLayout(layout);
+
+  auto buildNodeLayout = [&](int nodeId) {
+    NicGroupLayout nodeLayout;
+    int nodeBase = nodeId * nRanksPerNode;
+    int prevNuma = std::numeric_limits<int>::min();
+    for (int localRank = 0; localRank < nRanksPerNode; ++localRank) {
+      int device = devices[nodeBase + localRank];
+      int gpuNuma = -1;
+      try {
+        gpuNuma = mscclpp::getDeviceNumaNode(device);
+      } catch (...) {
+      }
+      bool startNewGroup =
+          nodeLayout.count == 0 ||
+          (gpuNuma != prevNuma && nodeLayout.count < hcaCount &&
+           nodeLayout.count < kMaxNicGroups);
+      if (startNewGroup) {
+        nodeLayout.base[nodeLayout.count] = localRank;
+        nodeLayout.size[nodeLayout.count] = 1;
+        nodeLayout.transportDevice[nodeLayout.count] = device;
+        ++nodeLayout.count;
+        prevNuma = gpuNuma;
+      } else {
+        ++nodeLayout.size[nodeLayout.count - 1];
+      }
+    }
+    return nodeLayout;
+  };
+
+  int nodeCount = nRanks / nRanksPerNode;
+  int localNodeId = rank / nRanksPerNode;
+  layout = buildNodeLayout(localNodeId);
+
+  // Group IDs pair leaders across nodes, so every node must have the same
+  // contiguous group boundaries. Otherwise use the single-slab fallback.
+  bool symmetricLayout = true;
+  for (int nodeId = 0; nodeId < nodeCount && symmetricLayout; ++nodeId) {
+    auto peerLayout = buildNodeLayout(nodeId);
+    if (peerLayout.count != layout.count) {
+      symmetricLayout = false;
+      break;
+    }
+    for (int groupId = 0; groupId < layout.count; ++groupId) {
+      if (peerLayout.base[groupId] != layout.base[groupId] ||
+          peerLayout.size[groupId] != layout.size[groupId]) {
+        symmetricLayout = false;
+        break;
+      }
+    }
+  }
+  if (!symmetricLayout) {
+    layout.count = 1;
+    layout.base[0] = 0;
+    layout.size[0] = nRanksPerNode;
+    layout.transportDevice[0] = devices[localNodeId * nRanksPerNode];
+  }
+  return cacheLayout(layout);
+}
+
+int groupForLocalRank(NicGroupLayout const& layout, int localRank) {
+  for (int groupId = 0; groupId < layout.count; ++groupId) {
+    if (localRank >= layout.base[groupId] &&
+        localRank < layout.base[groupId] + layout.size[groupId]) {
+      return groupId;
+    }
+  }
+  return layout.count - 1;
+}
+
+AgContext& getNumaContext(
+    ncclComm_t commHandle, std::shared_ptr<Communicator> bootstrapComm,
+    int rank, int nRanks, int nRanksPerNode, int cudaDevice, int groupId) {
+  auto layout = getNicGroupLayout(commHandle, bootstrapComm, rank, nRanks,
+                                  nRanksPerNode, cudaDevice);
+  int groupBase = layout.base[groupId];
+  int groupSize = layout.size[groupId];
+  int transportDevice = layout.transportDevice[groupId];
+  return getContext(
+      [&]() -> std::unique_ptr<AgContext>& {
+        return gNumaContexts[commHandle][groupId];
+      },
+      commHandle, bootstrapComm, rank, nRanks, nRanksPerNode, cudaDevice,
+      groupId, groupBase, groupSize,
+      transportDevice, /*numaSplit=*/true, "NUMA AllGather");
+}
+
+bool isTwoNodeLayout(int nRanks, int nRanksPerNode) {
+  return nRanksPerNode > 0 && nRanks == 2 * nRanksPerNode;
+}
+
+bool isMultiNodeLayout(int nRanks, int nRanksPerNode) {
+  return nRanksPerNode > 0 && nRanks % nRanksPerNode == 0 &&
+         nRanks / nRanksPerNode >= 2;
+}
+
+bool isRankInGroup(AgContext const& ctx) {
+  return ctx.localRank >= ctx.groupBase &&
+         ctx.localRank < ctx.groupBase + ctx.groupSize;
+}
+
+size_t recvBlockOffset(int sourceNode, size_t blockBytes) {
+  return static_cast<size_t>(sourceNode) * blockBytes;
+}
+
+size_t pipelineChunkBytes(AgContext const& ctx) {
+  return (!ctx.numaSplit && ctx.nRanksPerNode == 2)
+             ? kTwoGpuPipelineChunkBytes
+             : kDefaultPipelineChunkBytes;
+}
+
+size_t smallCutoffBytes(int nRanksPerNode) {
+  if (nRanksPerNode == 1) return kOneRankSmallCutoffBytes;
+  if (nRanksPerNode == 2) return kTwoGpuSmallCutoffBytes;
+  return kSmallCutoffBytes;
+}
+
+size_t slotChunkBytes(AgContext const& ctx, size_t bytesPerRank,
+                      size_t chunkBytes) {
+  size_t pipelineBytes = pipelineChunkBytes(ctx);
+  return bytesPerRank > pipelineBytes ? pipelineBytes : chunkBytes;
+}
+
+size_t slotCountForChunk(AgContext const& ctx, size_t slotBytes) {
+  return std::max<size_t>(1, ctx.chunkCapacity / slotBytes);
+}
+
+size_t genericSlotCountForChunk(AgContext const& ctx, size_t bytesPerRank,
+                                size_t slotBytes) {
+  // Messages beyond the one-rank fast path use the old small ring to avoid
+  // expanding the generic fallback's reuse window unintentionally.
+  bool oneRankFallback = !ctx.numaSplit && ctx.nodeCount == 2 &&
+                         ctx.nRanksPerNode == 1 &&
+                         bytesPerRank > kOneRankPipelineMaxBytes;
+  size_t capacity = oneRankFallback ? kMaxBytesPerRank : ctx.chunkCapacity;
+  return std::max<size_t>(1, capacity / slotBytes);
+}
+
+size_t sendSlotOffset(size_t slot, size_t blockBytes) {
+  return slot * blockBytes;
+}
+
+size_t recvSlotOffset(size_t slot, int nodeCount, size_t blockBytes) {
+  return slot * static_cast<size_t>(nodeCount) * blockBytes;
+}
+
+bool isOneRankPerNodeInPlace(AgContext const& ctx, void const* sendbuff,
+                             void* recvbuff, size_t bytesPerRank,
+                             size_t chunkOffset) {
+  auto const* send = static_cast<char const*>(sendbuff);
+  auto* recv = static_cast<char*>(recvbuff);
+  size_t selfOffset = static_cast<size_t>(ctx.rank) * bytesPerRank + chunkOffset;
+  return send + chunkOffset == recv + selfOffset;
+}
+
+ncclResult_t copyOneRankPerNodeChunkToOutput(
+    AgContext const& ctx, void const* sendbuff, void* recvbuff,
+    size_t bytesPerRank, size_t chunkOffset, size_t chunkBytes,
+    char const* remoteChunk, cudaStream_t stream) {
+  auto const* send = static_cast<char const*>(sendbuff);
+  auto* recv = static_cast<char*>(recvbuff);
+  int remoteRank = (1 - ctx.nodeId) * ctx.nRanksPerNode;
+  size_t selfOffset = static_cast<size_t>(ctx.rank) * bytesPerRank + chunkOffset;
+  size_t remoteOffset =
+      static_cast<size_t>(remoteRank) * bytesPerRank + chunkOffset;
+
+  if (send + chunkOffset != recv + selfOffset) {
+    mscclpp::lite::CpuSwitch<char>{}
+        .enqueueCopy<mscclpp::lite::MemoryType::Device,
+                     mscclpp::lite::MemoryType::Device, char const>(
+            {send + chunkOffset, chunkBytes},
+            {recv + selfOffset, chunkBytes},
+            stream);
+  }
+  mscclpp::lite::CpuSwitch<char>{}
+      .enqueueCopy<mscclpp::lite::MemoryType::HostPinned,
+                   mscclpp::lite::MemoryType::Device, char const>(
+          {remoteChunk, chunkBytes},
+          {recv + remoteOffset, chunkBytes},
+          stream);
+  return ncclSuccess;
+}
+
+ncclResult_t copyGroupChunkToOutput(
+    AgContext& ctx, void const* sendbuff, void* recvbuff, size_t bytesPerRank,
+    size_t chunkOffset, size_t chunkBytes, size_t sendBase, size_t recvBase,
+    size_t slotBlockBytes, cudaStream_t stream, bool selfPreCopied) {
+  auto const* send = static_cast<char const*>(sendbuff);
+  auto* recv = static_cast<char*>(recvbuff);
+  bool wholeRankChunk = chunkOffset == 0 && chunkBytes == bytesPerRank;
+  size_t blockBytes = static_cast<size_t>(ctx.groupSize) * chunkBytes;
+  bool directSelfCopy = chunkBytes >= kDirectSelfCopyMinBytes &&
+                        isRankInGroup(ctx);
+
+  for (int node = 0; node < ctx.nodeCount; ++node) {
+    int rankBase = node * ctx.nRanksPerNode + ctx.groupBase;
+    char const* src =
+        node == ctx.nodeId ? ctx.sendSlab + sendBase
+                           : ctx.recvSlab +
+                                 recvBase +
+                                 recvBlockOffset(node, slotBlockBytes);
+    bool localSelfBlock = directSelfCopy && node == ctx.nodeId;
+    if (wholeRankChunk && !localSelfBlock) {
+      mscclpp::lite::CpuSwitch<char>{}
+          .enqueueCopy<mscclpp::lite::MemoryType::HostPinned,
+                       mscclpp::lite::MemoryType::Device, char const>(
+              {static_cast<char const*>(src), blockBytes},
+              {recv + static_cast<size_t>(rankBase) * bytesPerRank, blockBytes},
+              stream);
+    } else {
+      for (int i = 0; i < ctx.groupSize; ++i) {
+        int peer = rankBase + i;
+        char* dst =
+            recv + static_cast<size_t>(peer) * bytesPerRank + chunkOffset;
+        if (localSelfBlock && peer == ctx.rank) {
+          char const* selfSrc = send + chunkOffset;
+          if (!selfPreCopied && selfSrc != dst) {
+            mscclpp::lite::CpuSwitch<char>{}
+                .enqueueCopy<mscclpp::lite::MemoryType::Device,
+                             mscclpp::lite::MemoryType::Device, char const>(
+                    {selfSrc, chunkBytes},
+                    {dst, chunkBytes},
+                    stream);
+          }
+        } else {
+          mscclpp::lite::CpuSwitch<char>{}
+              .enqueueCopy<mscclpp::lite::MemoryType::HostPinned,
+                           mscclpp::lite::MemoryType::Device, char const>(
+                  {src + static_cast<size_t>(i) * chunkBytes, chunkBytes},
+                  {dst, chunkBytes},
+                  stream);
+        }
+      }
+    }
+  }
+  return ncclSuccess;
+}
+
+void waitForGroupInput(AgContext& ctx, int rank, uint64_t epoch) {
+  if (!activeDeviceCall) return ctx.exchBuf->waitCpu(rank, epoch);
+  int spins = 0;
+  for (;;) {
+    checkDeviceAllGatherAbort();
+    uint64_t value = __atomic_load_n(&ctx.exchBuf->control()->d2hReady[rank], __ATOMIC_ACQUIRE);
+    if (value == UINT64_MAX)
+      throw mscclpp::Error("device AllGather peer failed", mscclpp::ErrorCode::SystemError);
+    if (value >= epoch) break;
+    if (spins++ < kPollSpinsBeforeYield) {
+      asm volatile("pause" ::: "memory");
+    } else {
+      std::this_thread::yield();
+    }
+  }
+  std::atomic_thread_fence(std::memory_order_acquire);
+}
+
+ncclResult_t exchangeGroupChunk(AgContext& ctx,
+                                void const* sendbuff, void* recvbuff,
+                                size_t bytesPerRank, size_t chunkOffset,
+                                size_t chunkBytes, cudaStream_t stream,
+                                bool copyAsSoonAsReady,
+                                bool selfPreCopied,
+                                std::shared_ptr<Communicator> bootstrapComm) {
+  uint64_t epoch = ++ctx.epoch;
+  size_t blockBytes = static_cast<size_t>(ctx.groupSize) * chunkBytes;
+  size_t slotBytes = slotChunkBytes(ctx, bytesPerRank, chunkBytes);
+  size_t slotBlockBytes = static_cast<size_t>(ctx.groupSize) * slotBytes;
+  size_t slotCount = genericSlotCountForChunk(ctx, bytesPerRank, slotBytes);
+  size_t slot = static_cast<size_t>((epoch - 1) % slotCount);
+  bool useAck = slotCount == 1;
+  cudaStream_t d2hStream = ctx.d2hStream ? ctx.d2hStream : stream;
+  cudaStream_t h2dStream = ctx.h2dStream ? ctx.h2dStream : stream;
+  if (!useAck && ctx.h2dStream != nullptr) {
+    ensureSlotEvents(ctx, slotCount);
+  }
+  if (!useAck && epoch > slotCount && ctx.h2dStream != nullptr) {
+    waitForCudaEvent(ctx.h2dSlotEvents[slot]);
+    ctx.ctrl->h2dDone[ctx.localRank].store(epoch, std::memory_order_release);
+    if (ctx.isLeader) {
+      for (int i = 0; i < ctx.nRanksPerNode; ++i) {
+        waitForEpoch(ctx.ctrl->h2dDone[i], epoch);
+      }
+      ctx.ctrl->ackSignal[ctx.nodeId].store(epoch,
+                                            std::memory_order_release);
+      for (size_t peer = 0; peer < ctx.peerNodeIds.size(); ++peer) {
+        ctx.peerConnections[peer].write(
+            ctx.peerRemoteCtrlMemory[peer], ackReadyOffset(ctx.nodeId),
+            ctx.ctrlMemory, ackSignalOffset(ctx.nodeId), sizeof(uint64_t));
+        ctx.peerConnections[peer].flush();
+      }
+    }
+    for (int peerNode : ctx.peerNodeIds) {
+      waitForEpoch(ctx.ctrl->ackReady[peerNode], epoch);
+    }
+  } else if (!useAck && slot == 0 && epoch > 1) {
+    MSCCLPP_CUDATHROW(cudaStreamSynchronize(h2dStream));
+    bootstrapComm->bootstrap()->barrier();
+  }
+  size_t sendBase = sendSlotOffset(slot, slotBlockBytes);
+  size_t recvBase = recvSlotOffset(slot, ctx.nodeCount, slotBlockBytes);
+  bool inGroup = isRankInGroup(ctx);
+  bool oneRankLayout = ctx.nodeCount == 2 && ctx.nRanksPerNode == 1;
+  bool oneRankInPlace =
+      oneRankLayout &&
+      isOneRankPerNodeInPlace(ctx, sendbuff, recvbuff, bytesPerRank,
+                              chunkOffset);
+  bool preCopiedSelf =
+      oneRankLayout && !oneRankInPlace &&
+      chunkBytes >= kOneRankDirectCopyCutoffBytes;
+  // Generic slab exchange: D2H into the host slot, leader RDMA write of the
+  // contiguous block, then H2D into final rank order.  Unlike the old code
+  // which called waitForCudaStream() to block the CPU until D2H completed,
+  // push() enqueues the D2H + a GPU-side flag write on d2hStream.  Non-leader
+  // ranks proceed immediately to waitForEpoch(rdmaReady) without blocking;
+  // the leader waitCpu()-spins on the GPU-written flags before starting RDMA.
+  if (inGroup) {
+    auto const* send = static_cast<char const*>(sendbuff);
+    int localSlot = ctx.localRank - ctx.groupBase;
+    ctx.exchBuf->push(d2hStream,
+                      send + chunkOffset,
+                      sendBase + static_cast<size_t>(localSlot) * chunkBytes,
+                      chunkBytes, ctx.localRank, epoch);
+    if (preCopiedSelf) {
+      auto const* sendBytes = static_cast<char const*>(sendbuff);
+      auto* recvBytes = static_cast<char*>(recvbuff);
+      size_t selfOffset =
+          static_cast<size_t>(ctx.rank) * bytesPerRank + chunkOffset;
+      mscclpp::lite::CpuSwitch<char>{}
+          .enqueueCopy<mscclpp::lite::MemoryType::Device,
+                       mscclpp::lite::MemoryType::Device, char const>(
+              {sendBytes + chunkOffset, chunkBytes},
+              {recvBytes + selfOffset, chunkBytes},
+              h2dStream);
+    }
+  }
+
+  if (ctx.isLeader) {
+    for (int i = 0; i < ctx.groupSize; ++i) {
+      waitForGroupInput(ctx, ctx.groupBase + i, epoch);
+    }
+
+    ctx.ctrl->rdmaSignal[ctx.nodeId].store(epoch,
+                                           std::memory_order_release);
+    for (size_t peer = 0; peer < ctx.peerNodeIds.size(); ++peer) {
+      int peerNode = ctx.peerNodeIds[peer];
+      size_t remoteBase =
+          recvBase + recvBlockOffset(ctx.nodeId, slotBlockBytes);
+      bool usedDirectData =
+          peerNode == 1 - ctx.nodeId &&
+          (writeDataStripedToRemoteRecv(ctx, remoteBase, sendBase,
+                                        blockBytes) ||
+           writeDataDirectToRemoteRecv(ctx, remoteBase, sendBase, blockBytes));
+      if (!usedDirectData) {
+        size_t off = 0;
+        int writesSinceFlush = 0;
+        while (off < blockBytes) {
+          size_t chunk = std::min(kRdmaChunkBytes, blockBytes - off);
+          ctx.peerConnections[peer].write(ctx.peerRemoteRecvMemory[peer],
+                                          remoteBase + off, ctx.sendMemory,
+                                          sendBase + off, chunk);
+          if (++writesSinceFlush == kSignalEveryN) {
+            ctx.peerConnections[peer].flush();
+            writesSinceFlush = 0;
+          }
+          off += chunk;
+        }
+      }
+      signalRdmaReadyAtomic(ctx, peer, epoch);
+      (void)peerNode;
+    }
+  }
+  for (int peerNode : ctx.peerNodeIds) {
+    waitForEpoch(ctx.ctrl->rdmaReady[peerNode], epoch);
+  }
+
+  if (copyAsSoonAsReady) {
+    // Device-service calls use independent DMA streams while the caller CTA
+    // waits. Before reading local peers' sendSlab, their consumers must observe
+    // local D2H completion as well as remote RDMA readiness. Keep this additional
+    // wait exclusive to GPU-driven calls; native host dispatch is unchanged.
+    if (activeDeviceCall && !ctx.isLeader) {
+      for (int i = 0; i < ctx.groupSize; ++i) {
+        waitForGroupInput(ctx, ctx.groupBase + i, epoch);
+      }
+    }
+    bool oneRankDirectCopy =
+        oneRankLayout &&
+        (oneRankInPlace || chunkBytes >= kOneRankDirectCopyCutoffBytes);
+    ncclResult_t result = ncclSuccess;
+    if (oneRankDirectCopy && preCopiedSelf) {
+      auto* recvBytes = static_cast<char*>(recvbuff);
+      int remoteRank = (1 - ctx.nodeId) * ctx.nRanksPerNode;
+      size_t remoteOffset =
+          static_cast<size_t>(remoteRank) * bytesPerRank + chunkOffset;
+      mscclpp::lite::CpuSwitch<char>{}
+          .enqueueCopy<mscclpp::lite::MemoryType::HostPinned,
+                       mscclpp::lite::MemoryType::Device, char const>(
+              {ctx.recvSlab + recvBase +
+                   recvBlockOffset(1 - ctx.nodeId, slotBlockBytes),
+               chunkBytes},
+              {recvBytes + remoteOffset, chunkBytes},
+              h2dStream);
+    } else if (oneRankDirectCopy) {
+      result = copyOneRankPerNodeChunkToOutput(
+          ctx, sendbuff, recvbuff, bytesPerRank, chunkOffset, chunkBytes,
+          ctx.recvSlab + recvBase +
+              recvBlockOffset(1 - ctx.nodeId, slotBlockBytes),
+          h2dStream);
+    } else {
+      result = copyGroupChunkToOutput(
+        ctx, sendbuff, recvbuff, bytesPerRank, chunkOffset, chunkBytes,
+        sendBase, recvBase, slotBlockBytes, h2dStream, selfPreCopied);
+    }
+    if (result != ncclSuccess) return result;
+    if (useAck) {
+      MSCCLPP_CUDATHROW(cudaStreamSynchronize(h2dStream));
+      ctx.ctrl->h2dDone[ctx.localRank].store(epoch, std::memory_order_release);
+
+      for (int i = 0; i < ctx.nRanksPerNode; ++i) {
+        waitForEpoch(ctx.ctrl->h2dDone[i], epoch);
+      }
+      if (ctx.isLeader) {
+        ctx.ctrl->ackSignal[ctx.nodeId].store(epoch,
+                                              std::memory_order_release);
+        for (size_t peer = 0; peer < ctx.peerNodeIds.size(); ++peer) {
+          ctx.peerConnections[peer].write(
+              ctx.peerRemoteCtrlMemory[peer], ackReadyOffset(ctx.nodeId),
+              ctx.ctrlMemory, ackSignalOffset(ctx.nodeId), sizeof(uint64_t));
+          ctx.peerConnections[peer].flush();
+        }
+      }
+      for (int peerNode : ctx.peerNodeIds) {
+        waitForEpoch(ctx.ctrl->ackReady[peerNode], epoch);
+      }
+    } else if (ctx.h2dStream != nullptr) {
+      MSCCLPP_CUDATHROW(cudaEventRecord(ctx.h2dSlotEvents[slot], h2dStream));
+    }
+  }
+  return ncclSuccess;
+}
+
+ncclResult_t runOneRankChunkPipeline(
+    AgContext& ctx, void const* sendbuff, void* recvbuff,
+    size_t bytesPerRank) {
+  uint64_t epoch = ++ctx.epoch;
+  size_t slotCount = slotCountForChunk(ctx, bytesPerRank);
+  size_t slot = static_cast<size_t>((epoch - 1) % slotCount);
+  bool useAck = slotCount == 1;
+  ensureSlotEvents(ctx, slotCount);
+
+  // Reusing a full-message slot is safe only after the remote chunk H2Ds that
+  // read from that slot have completed.  Multi-slot cases use per-slot H2D
+  // events; the single-slot fallback uses an explicit remote ack.
+  if (!useAck && epoch > slotCount) {
+    waitForCudaEvent(ctx.h2dSlotEvents[slot]);
+    ctx.ctrl->h2dDone[ctx.localRank].store(epoch, std::memory_order_release);
+    ctx.ctrl->ackSignal[ctx.nodeId].store(epoch, std::memory_order_release);
+    ctx.connection.write(ctx.remoteCtrlMemory, ackReadyOffset(ctx.nodeId),
+                         ctx.ctrlMemory, ackSignalOffset(ctx.nodeId),
+                         sizeof(uint64_t));
+    ctx.connection.flush();
+    waitForEpoch(ctx.ctrl->ackReady[1 - ctx.nodeId], epoch);
+  }
+
+  size_t sendBase = sendSlotOffset(slot, bytesPerRank);
+  size_t recvBase = recvSlotOffset(slot, ctx.nodeCount, bytesPerRank);
+  auto const* send = static_cast<char const*>(sendbuff);
+  auto* recv = static_cast<char*>(recvbuff);
+  size_t selfOffset = static_cast<size_t>(ctx.rank) * bytesPerRank;
+  size_t remoteRank = static_cast<size_t>((1 - ctx.nodeId) * ctx.nRanksPerNode);
+  size_t remoteOutputOffset = remoteRank * bytesPerRank;
+  size_t localRemoteBase =
+      recvBase + recvBlockOffset(1 - ctx.nodeId, bytesPerRank);
+  size_t peerRemoteBase = recvBase + recvBlockOffset(ctx.nodeId, bytesPerRank);
+
+  if (send != recv + selfOffset) {
+    mscclpp::lite::CpuSwitch<char>{}
+        .enqueueCopy<mscclpp::lite::MemoryType::Device,
+                     mscclpp::lite::MemoryType::Device, char const>(
+            {send, bytesPerRank},
+            {recv + selfOffset, bytesPerRank},
+            ctx.h2dStream);
+  }
+
+  size_t chunkCount =
+      (bytesPerRank + kOneRankPipelineChunkBytes - 1) /
+      kOneRankPipelineChunkBytes;
+  ensureD2hChunkEvents(ctx, chunkCount);
+  // Stage all D2H copies first, then let the CPU issue RDMA writes as each D2H
+  // event becomes visible.  This overlaps GPU copy readiness, NIC DMA reads,
+  // and the peer's H2D copies without involving CUDA kernels.
+  for (size_t chunk = 0; chunk < chunkCount; ++chunk) {
+    size_t off = chunk * kOneRankPipelineChunkBytes;
+    size_t bytes = std::min(kOneRankPipelineChunkBytes, bytesPerRank - off);
+    mscclpp::lite::CpuSwitch<char>{}
+        .enqueueCopy<mscclpp::lite::MemoryType::Device,
+                     mscclpp::lite::MemoryType::HostPinned, char const>(
+            {send + off, bytes},
+            {ctx.sendSlab + sendBase + off, bytes},
+            ctx.d2hStream);
+    MSCCLPP_CUDATHROW(cudaEventRecord(ctx.d2hChunkEvents[chunk],
+                                      ctx.d2hStream));
+  }
+
+  auto sendChunk = [&](size_t chunk) {
+    size_t off = chunk * kOneRankPipelineChunkBytes;
+    size_t bytes = std::min(kOneRankPipelineChunkBytes, bytesPerRank - off);
+    uint64_t readyValue = epoch * kPipeValueStride + chunk + 1;
+    // The NIC reads RDMA-write sources asynchronously, so every chunk needs a
+    // stable flag word.  Reusing one host control word can publish a later
+    // ready value before the matching data write has completed.
+    size_t flagSrcOffset = ctx.chunkCapacity + chunk * sizeof(readyValue);
+    std::memcpy(ctx.sendSlab + flagSrcOffset, &readyValue, sizeof(readyValue));
+    std::atomic_thread_fence(std::memory_order_release);
+    waitForCudaEvent(ctx.d2hChunkEvents[chunk]);
+    if (!writePipelineChunkDirect(ctx, peerRemoteBase + off, sendBase + off,
+                                  bytes, flagSrcOffset)) {
+      ctx.connection.write(ctx.remoteRecvMemory, peerRemoteBase + off,
+                           ctx.sendMemory, sendBase + off, bytes);
+      ctx.connection.write(ctx.remoteCtrlMemory, pipeReadyOffset(ctx.nodeId),
+                           ctx.sendMemory, flagSrcOffset,
+                           sizeof(uint64_t));
+      ctx.connection.flush();
+    }
+  };
+
+  size_t nextSend = 0;
+  size_t initialWindow = std::min(kOneRankPipelineSendWindow, chunkCount);
+  for (; nextSend < initialWindow; ++nextSend) {
+    sendChunk(nextSend);
+  }
+  // Window size is intentionally one: after each incoming ready value is
+  // consumed, post one more outgoing RDMA chunk.  This keeps both nodes paced
+  // by receive progress while still overlapping D2H, RDMA, and H2D.
+  for (size_t chunk = 0; chunk < chunkCount; ++chunk) {
+    size_t off = chunk * kOneRankPipelineChunkBytes;
+    size_t bytes = std::min(kOneRankPipelineChunkBytes, bytesPerRank - off);
+    uint64_t readyValue = epoch * kPipeValueStride + chunk + 1;
+    waitForEpoch(ctx.ctrl->pipeReady[1 - ctx.nodeId], readyValue);
+    mscclpp::lite::CpuSwitch<char>{}
+        .enqueueCopy<mscclpp::lite::MemoryType::HostPinned,
+                     mscclpp::lite::MemoryType::Device, char const>(
+            {ctx.recvSlab + localRemoteBase + off, bytes},
+            {recv + remoteOutputOffset + off, bytes},
+            ctx.h2dStream);
+    if (nextSend < chunkCount) {
+      sendChunk(nextSend++);
+    }
+  }
+
+  if (useAck) {
+    MSCCLPP_CUDATHROW(cudaStreamSynchronize(ctx.h2dStream));
+    ctx.ctrl->h2dDone[ctx.localRank].store(epoch, std::memory_order_release);
+    ctx.ctrl->ackSignal[ctx.nodeId].store(epoch, std::memory_order_release);
+    ctx.connection.write(ctx.remoteCtrlMemory, ackReadyOffset(ctx.nodeId),
+                         ctx.ctrlMemory, ackSignalOffset(ctx.nodeId),
+                         sizeof(uint64_t));
+    ctx.connection.flush();
+    waitForEpoch(ctx.ctrl->ackReady[1 - ctx.nodeId], epoch);
+  } else {
+    MSCCLPP_CUDATHROW(cudaEventRecord(ctx.h2dSlotEvents[slot],
+                                      ctx.h2dStream));
+  }
+  return ncclSuccess;
+}
+
+ncclResult_t executeSingleSlabSchedule(AgContext& ctx, void const* sendbuff, void* recvbuff, size_t bytesPerRank, cudaStream_t stream, std::shared_ptr<Communicator> bootstrapComm) {
+  int rank = ctx.rank;
+  int nRanksPerNode = ctx.nRanksPerNode;
+    ensurePipelineStreams(ctx);
+    MSCCLPP_CUDATHROW(cudaEventRecord(ctx.inputReadyEvent, stream));
+    MSCCLPP_CUDATHROW(cudaStreamWaitEvent(ctx.d2hStream,
+                                         ctx.inputReadyEvent, 0));
+    MSCCLPP_CUDATHROW(cudaStreamWaitEvent(ctx.h2dStream,
+                                         ctx.inputReadyEvent, 0));
+    auto const* send = static_cast<char const*>(sendbuff);
+    auto* recv = static_cast<char*>(recvbuff);
+    bool selfInPlace =
+        send == recv + static_cast<size_t>(rank) * bytesPerRank;
+    bool selfPreCopied = false;
+    if (!selfInPlace && nRanksPerNode > 1 &&
+        bytesPerRank >= kDirectSelfCopyMinBytes) {
+      mscclpp::lite::CpuSwitch<char>{}
+          .enqueueCopy<mscclpp::lite::MemoryType::Device,
+                       mscclpp::lite::MemoryType::Device, char const>(
+              {send, bytesPerRank},
+              {recv + static_cast<size_t>(rank) * bytesPerRank, bytesPerRank},
+              ctx.h2dStream);
+      selfPreCopied = true;
+    }
+    if (ctx.nodeCount == 2 && ctx.nRanksPerNode == 1 &&
+        bytesPerRank >= 1024 * 1024 &&
+        bytesPerRank <= kOneRankPipelineMaxBytes) {
+      // 2nx1g is the only layout where one rank owns the whole node block, so
+      // the chunk pipeline can avoid local gather/scatter and directly stream
+      // the remote rank into final output order.
+      ncclResult_t result = runOneRankChunkPipeline(
+          ctx, sendbuff, recvbuff, bytesPerRank);
+      if (result != ncclSuccess) return result;
+      MSCCLPP_CUDATHROW(cudaEventRecord(ctx.h2dDoneEvent, ctx.h2dStream));
+      MSCCLPP_CUDATHROW(cudaStreamWaitEvent(stream, ctx.h2dDoneEvent, 0));
+      return ncclSuccess;
+    }
+    for (size_t chunkOffset = 0; chunkOffset < bytesPerRank;) {
+      size_t maxChunkBytes =
+          std::min(ctx.chunkCapacity, pipelineChunkBytes(ctx));
+      size_t chunkBytes = std::min(maxChunkBytes, bytesPerRank - chunkOffset);
+      ncclResult_t result =
+          exchangeGroupChunk(ctx, sendbuff, recvbuff, bytesPerRank,
+                                 chunkOffset, chunkBytes, stream,
+                                 /*copyAsSoonAsReady=*/true, selfPreCopied,
+                                 bootstrapComm);
+      if (result != ncclSuccess) return result;
+      chunkOffset += chunkBytes;
+    }
+    MSCCLPP_CUDATHROW(cudaEventRecord(ctx.h2dDoneEvent, ctx.h2dStream));
+    MSCCLPP_CUDATHROW(cudaStreamWaitEvent(stream, ctx.h2dDoneEvent, 0));
+    return ncclSuccess;
+}
+
+
+
+ncclResult_t copySmallFallbackOutput(AgContext& ctx,
+                                            void* recvbuff,
+                                            size_t bytesPerRank,
+                                            size_t chunkBytes,
+                                            cudaStream_t stream) {
+  size_t fullBytes = static_cast<size_t>(ctx.worldSize) * bytesPerRank;
+  size_t blockBytes = static_cast<size_t>(ctx.groupSize) * chunkBytes;
+  char* scratch = ctx.sendSlab + blockBytes +
+                  static_cast<size_t>(ctx.localRank) * fullBytes;
+  int localBase = ctx.nodeId * ctx.nRanksPerNode;
+  int remoteBase = (1 - ctx.nodeId) * ctx.nRanksPerNode;
+  int remoteNode = 1 - ctx.nodeId;
+  /* Assemble node blocks in global-rank order before the existing H2D. */
+  mscclpp::lite::CpuSwitch<char> cpuSwitch;
+  cpuSwitch.copy<mscclpp::lite::MemoryType::HostPinned,
+                 mscclpp::lite::MemoryType::HostPinned, char const>(
+      {ctx.sendSlab, blockBytes},
+      {scratch + static_cast<size_t>(localBase) * bytesPerRank, blockBytes});
+  cpuSwitch.copy<mscclpp::lite::MemoryType::HostPinned,
+                 mscclpp::lite::MemoryType::HostPinned, char const>(
+      {ctx.recvSlab + recvBlockOffset(remoteNode, blockBytes), blockBytes},
+      {scratch + static_cast<size_t>(remoteBase) * bytesPerRank, blockBytes});
+  cpuSwitch
+      .enqueueCopy<mscclpp::lite::MemoryType::HostPinned,
+                  mscclpp::lite::MemoryType::Device, char const>(
+          {scratch, fullBytes},
+          {static_cast<char*>(recvbuff), fullBytes},
+          stream);
+  return ncclSuccess;
+}
+
+ncclResult_t executeSmallFallbackSchedule(AgContext& ctx, void const* sendbuff, void* recvbuff, size_t bytesPerRank, cudaStream_t stream) {
+  int nRanksPerNode = ctx.nRanksPerNode;
+  size_t fullBytes = bytesPerRank * ctx.worldSize;
+    size_t blockBytes = static_cast<size_t>(ctx.groupSize) * bytesPerRank;
+    size_t scratchBytes = static_cast<size_t>(ctx.groupSize) * fullBytes;
+    if (blockBytes + scratchBytes > ctx.slabBytes) return ncclInvalidUsage;
+
+    uint64_t epoch = ++ctx.epoch;
+    auto const* send = static_cast<char const*>(sendbuff);
+    mscclpp::lite::CpuSwitch<char>{}
+        .enqueueCopy<mscclpp::lite::MemoryType::Device,
+                     mscclpp::lite::MemoryType::HostPinned, char const>(
+            {send, bytesPerRank},
+            {ctx.sendSlab + static_cast<size_t>(ctx.localRank) * bytesPerRank,
+             bytesPerRank},
+            stream);
+    MSCCLPP_CUDATHROW(cudaStreamSynchronize(stream));
+    ctx.ctrl->d2hReady[ctx.localRank].store(epoch, std::memory_order_release);
+
+    if (ctx.isLeader) {
+      for (int i = 0; i < ctx.groupSize; ++i) {
+        waitForEpoch(ctx.ctrl->d2hReady[i], epoch);
+      }
+      ctx.connection.write(ctx.remoteRecvMemory,
+                           recvBlockOffset(ctx.nodeId, blockBytes),
+                           ctx.sendMemory, 0, blockBytes);
+      ctx.ctrl->rdmaSignal[ctx.nodeId].store(epoch, std::memory_order_release);
+      signalRdmaReadyAtomic(ctx, ctx.connection, ctx.remoteCtrlMemory,
+                            1 - ctx.nodeId, epoch);
+    }
+    waitForEpoch(ctx.ctrl->rdmaReady[1 - ctx.nodeId], epoch);
+    for (int i = 0; i < ctx.groupSize; ++i) {
+      waitForEpoch(ctx.ctrl->d2hReady[i], epoch);
+    }
+
+    ncclResult_t result = copySmallFallbackOutput(
+        ctx, recvbuff, bytesPerRank, bytesPerRank, stream);
+    if (result != ncclSuccess) return result;
+    MSCCLPP_CUDATHROW(cudaStreamSynchronize(stream));
+
+    ctx.ctrl->h2dDone[ctx.localRank].store(epoch, std::memory_order_release);
+
+    for (int i = 0; i < ctx.nRanksPerNode; ++i) {
+      waitForEpoch(ctx.ctrl->h2dDone[i], epoch);
+    }
+    if (ctx.isLeader) {
+      ctx.ctrl->ackSignal[ctx.nodeId].store(epoch, std::memory_order_release);
+      ctx.connection.write(
+          ctx.remoteCtrlMemory, ackReadyOffset(ctx.nodeId),
+          ctx.ctrlMemory, ackSignalOffset(ctx.nodeId),
+          sizeof(uint64_t));
+      ctx.connection.flush();
+    }
+    waitForEpoch(ctx.ctrl->ackReady[1 - ctx.nodeId], epoch);
+    return ncclSuccess;
+}
+
+
+
+ncclResult_t runOneRankGpuDirect(
+    void const* sendbuff, void* recvbuff, size_t sendcount,
+    size_t bytesPerRank, ncclDataType_t datatype, ncclComm_t comm,
+    cudaStream_t stream, int rank, int nRanks, int nRanksPerNode,
+    std::shared_ptr<Communicator> bootstrapComm, int cudaDevice) {
+  if (!isTwoNodeLayout(nRanks, nRanksPerNode) || nRanksPerNode != 1) {
+    return ncclInvalidUsage;
+  }
+  size_t typeSize = ncclTypeSize(datatype);
+  if (typeSize == 0) return ncclInvalidArgument;
+  if (sendcount > std::numeric_limits<size_t>::max() / typeSize) {
+    return ncclInvalidArgument;
+  }
+  if (sendcount * typeSize != bytesPerRank) return ncclInvalidUsage;
+  if (bytesPerRank == 0) return ncclSuccess;
+  if (bytesPerRank >
+      std::numeric_limits<size_t>::max() / static_cast<size_t>(nRanks)) {
+    return ncclInvalidUsage;
+  }
+  size_t fullBytes = bytesPerRank * static_cast<size_t>(nRanks);
+
+  try {
+    mscclpp::CudaDeviceGuard deviceGuard(cudaDevice);
+    auto& ctx = getSingleContext(
+        comm, bootstrapComm, rank, nRanks, nRanksPerNode, cudaDevice);
+    ensurePipelineStreams(ctx);
+    if (!ensureGpuDirectOneRank(ctx, bootstrapComm, sendbuff, bytesPerRank,
+                                recvbuff, fullBytes)) {
+      return ncclInvalidUsage;
+    }
+
+    uint64_t epoch = ++ctx.epoch;
+    auto const* send = static_cast<char const*>(sendbuff);
+    auto* recv = static_cast<char*>(recvbuff);
+    size_t selfOffset = static_cast<size_t>(rank) * bytesPerRank;
+
+    MSCCLPP_CUDATHROW(cudaEventRecord(ctx.inputReadyEvent, stream));
+    waitForCudaEvent(ctx.inputReadyEvent);
+
+    if (send != recv + selfOffset) {
+      mscclpp::lite::CpuSwitch<char>{}
+          .enqueueCopy<mscclpp::lite::MemoryType::Device,
+                       mscclpp::lite::MemoryType::Device, char const>(
+              {send, bytesPerRank}, {recv + selfOffset, bytesPerRank}, stream);
+    }
+    if (!writeGpuDirectOneRank(ctx, bytesPerRank, epoch)) {
+      return ncclInvalidUsage;
+    }
+    waitForEpoch(ctx.ctrl->rdmaReady[1 - ctx.nodeId], epoch);
+    return ncclSuccess;
+  } catch (std::exception const& ex) {
+    WARN("GPUDirect AllGather failed: %s", ex.what());
+    return mapException(ex);
+  } catch (...) {
+    WARN("GPUDirect AllGather failed with an unknown exception");
+    return ncclInternalError;
+  }
+}
+
+ncclResult_t executeOrderedSmallSchedule(AgContext& ctx, void const* sendbuff, void* recvbuff, size_t bytesPerRank, cudaStream_t stream, std::shared_ptr<Communicator> bootstrapComm, LiteNetworkControl* deviceCall, uint64_t sequence) {
+  int rank = ctx.rank;
+  size_t fullBytes = bytesPerRank * ctx.worldSize;
+    bool useOneRankRegister =
+        ctx.nodeCount == 2 && ctx.nRanksPerNode == 1 &&
+        fullBytes < kOneRankMappedOutputCutoffBytes &&
+        ctx.sendDeviceSlab != nullptr && (!deviceCall || deviceCall->mapped) && ctx.ctrlDeviceSlab != nullptr;
+    bool useTwoRankRecvKernel =
+        ctx.nodeCount == 2 && ctx.nRanksPerNode == 2 &&
+        fullBytes <= 4 * 1024 && ctx.sendDeviceSlab != nullptr && (!deviceCall || deviceCall->mapped);
+    bool useTwoRankRegisterPack =
+        ctx.nodeCount == 2 && ctx.nRanksPerNode == 2 &&
+        fullBytes >= 512 && fullBytes <= 4 * 1024 &&
+        ctx.sendDeviceSlab != nullptr && (!deviceCall || deviceCall->mapped) && ctx.ctrlDeviceSlab != nullptr;
+    bool useTwoRankTinyPack =
+        ctx.nodeCount == 2 && ctx.nRanksPerNode == 2 &&
+        fullBytes <= 256 && ctx.sendDeviceSlab != nullptr && (!deviceCall || deviceCall->mapped) &&
+        ctx.ctrlDeviceSlab != nullptr;
+    bool useTwoRankGpuPack =
+        useTwoRankTinyPack || useTwoRankRegisterPack;
+    // Small rows are latency-bound.  Keep one ordered host slot per epoch so
+    // the receiver can H2D final AllGather order without a CPU repack step.
+    size_t blockBytes = static_cast<size_t>(ctx.groupSize) * bytesPerRank;
+    if (blockBytes == 0) return ncclSuccess;
+    size_t compactFlagOffset =
+        (bytesPerRank + sizeof(uint64_t) - 1) & ~(sizeof(uint64_t) - 1);
+    size_t compactSegmentBytes = compactFlagOffset + sizeof(uint64_t);
+    size_t perSlotBytes = useOneRankRegister
+                              ? 2 * compactSegmentBytes
+                              : fullBytes + sizeof(uint64_t);
+    size_t slotCount =
+        std::min(kSmallMaxSlots, ctx.slabBytes / perSlotBytes);
+    if (slotCount < 2) return ncclInvalidUsage;
+    if (ctx.smallPerSlotBytes != 0 &&
+        ctx.smallPerSlotBytes != perSlotBytes) {
+      MSCCLPP_CUDATHROW(cudaStreamSynchronize(stream));
+      if (ctx.isLeader) pollQp(ctx);
+      bootstrapComm->bootstrap()->barrier();
+      ctx.smallWrCount = 0;
+    }
+    ctx.smallPerSlotBytes = perSlotBytes;
+
+    uint64_t epoch = ++ctx.epoch;
+    size_t slot = static_cast<size_t>((epoch - 1) % slotCount);
+    if (epoch > 1 && slot == 0) {
+      MSCCLPP_CUDATHROW(cudaStreamSynchronize(stream));
+      if (ctx.isLeader) pollQp(ctx);
+      bootstrapComm->bootstrap()->barrier();
+    }
+    size_t slotOffset = slot * perSlotBytes;
+    size_t flagOffset = slotOffset + fullBytes;
+    // Slot layout is final-output order: [rank0][rank1]...[rankN][flag].
+    // This lets every rank finish with one H2D of the complete AllGather output.
+    auto const* send = static_cast<char const*>(sendbuff);
+    bool oneRankInPlace =
+        isOneRankPerNodeInPlace(ctx, sendbuff, recvbuff, bytesPerRank,
+                                /*chunkOffset=*/0);
+    if (deviceCall) {
+      deviceCall->epoch = epoch;
+      deviceCall->slab = const_cast<char*>(ctx.sendDeviceSlab);
+      deviceCall->control = ctx.ctrlDeviceSlab;
+      deviceCall->slotOffset = slotOffset;
+      deviceCall->flagOffset = flagOffset;
+      deviceCall->segmentBytes = compactSegmentBytes;
+      deviceCall->flagInSegment = compactFlagOffset;
+      deviceCall->readyOffset = d2hReadyOffset(ctx.localRank);
+      deviceCall->readyBase = offsetof(HostControl, d2hReady);
+      deviceCall->readyStride = sizeof(std::atomic<uint64_t>);
+      deviceCall->localGroupSize = ctx.groupSize;
+      deviceCall->oneRankRegister = useOneRankRegister;
+      deviceCall->stageWithSm = useOneRankRegister || useTwoRankGpuPack;
+      deviceCall->receiveWithSm = useOneRankRegister || useTwoRankRecvKernel;
+      // Clear before publication. The GPU may publish ready immediately.
+      if (useOneRankRegister)
+        ctx.ctrl->d2hReady[ctx.localRank].store(0, std::memory_order_release);
+      __atomic_store_n(&deviceCall->prepared, sequence, __ATOMIC_RELEASE);
+    }
+    if (useOneRankRegister) {
+      if (!deviceCall)
+        ctx.ctrl->d2hReady[ctx.localRank].store(0, std::memory_order_release);
+      bool useTinyOriginal = fullBytes == 128;
+      bool useParallelOriginal = fullBytes == 256;
+      waitForEpoch(ctx.ctrl->d2hReady[ctx.localRank], epoch);
+      if (useTinyOriginal || useParallelOriginal) {
+        ctx.ctrl->rdmaSignal[ctx.nodeId].store(epoch,
+                                               std::memory_order_release);
+        std::atomic_thread_fence(std::memory_order_release);
+        size_t dataOffset =
+            slotOffset + static_cast<size_t>(ctx.nodeId) * bytesPerRank;
+        writeOrderedSlot(ctx, dataOffset, flagOffset, bytesPerRank);
+      } else {
+        size_t segmentOffset =
+            slotOffset + static_cast<size_t>(ctx.nodeId) * compactSegmentBytes;
+        *reinterpret_cast<uint64_t*>(ctx.sendSlab + segmentOffset +
+                                     compactFlagOffset) = epoch;
+        std::atomic_thread_fence(std::memory_order_release);
+        writeCompactSlot(ctx, segmentOffset, compactSegmentBytes);
+      }
+      return ncclSuccess;
+    }
+    if (!useTwoRankGpuPack) {
+      mscclpp::lite::CpuSwitch<char>{}
+          .enqueueCopy<mscclpp::lite::MemoryType::Device,
+                       mscclpp::lite::MemoryType::HostPinned, char const>(
+              {send, bytesPerRank},
+              {ctx.sendSlab + slotOffset + static_cast<size_t>(rank) * bytesPerRank,
+               bytesPerRank},
+              stream);
+    }
+    if (useTwoRankRecvKernel) {
+      if (!useTwoRankTinyPack && !useTwoRankRegisterPack) {
+        ensurePipelineStreams(ctx);
+        MSCCLPP_CUDATHROW(cudaEventRecord(ctx.inputReadyEvent, stream));
+      }
+
+      if (!useTwoRankGpuPack) {
+        waitForCudaEvent(ctx.inputReadyEvent);
+      }
+    } else if (ctx.nRanksPerNode <= 2) {
+      if (!useTwoRankGpuPack) {
+        ensurePipelineStreams(ctx);
+        MSCCLPP_CUDATHROW(cudaEventRecord(ctx.inputReadyEvent, stream));
+        waitForCudaEvent(ctx.inputReadyEvent);
+      }
+    } else {
+      waitForCudaStream(stream);
+    }
+
+    if (ctx.isLeader) {
+      if (ctx.nRanksPerNode == 1) {
+        std::atomic_thread_fence(std::memory_order_release);
+      } else {
+        if (!useTwoRankGpuPack) {
+          ctx.ctrl->d2hReady[ctx.localRank].store(
+              epoch, std::memory_order_release);
+        }
+        for (int i = 0; i < ctx.groupSize; ++i) {
+          waitForEpoch(ctx.ctrl->d2hReady[i], epoch);
+        }
+      }
+      ctx.ctrl->rdmaSignal[ctx.nodeId].store(epoch, std::memory_order_release);
+      std::atomic_thread_fence(std::memory_order_release);
+      // Leader ships the local node's contiguous half of the output slot.
+      size_t dataOffset =
+          slotOffset + static_cast<size_t>(ctx.nodeId * ctx.nRanksPerNode) *
+                           bytesPerRank;
+      // Same-QP ordering makes the flag visible only after the data write.
+      writeOrderedSlot(ctx, dataOffset, flagOffset, blockBytes);
+    } else {
+      if (!useTwoRankGpuPack) {
+        ctx.ctrl->d2hReady[ctx.localRank].store(epoch,
+                                                std::memory_order_release);
+      }
+    }
+    waitForSlotReady(ctx.sendSlab + flagOffset, epoch);
+    if (ctx.nRanksPerNode != 1 && !ctx.isLeader) {
+      for (int i = 0; i < ctx.groupSize; ++i) {
+        waitForEpoch(ctx.ctrl->d2hReady[i], epoch);
+      }
+    }
+
+    if (useTwoRankRecvKernel) {
+      return ncclSuccess;
+    }
+    bool oneRankDirectCopy =
+        ctx.nodeCount == 2 && ctx.nRanksPerNode == 1 &&
+        (oneRankInPlace || fullBytes >= 128 * 1024) &&
+        fullBytes != 32 * 1024;
+    if (oneRankDirectCopy) {
+      int remoteRank = (1 - ctx.nodeId) * ctx.nRanksPerNode;
+      ncclResult_t result = copyOneRankPerNodeChunkToOutput(
+          ctx, sendbuff, recvbuff, bytesPerRank, /*chunkOffset=*/0,
+          bytesPerRank,
+          ctx.sendSlab + slotOffset +
+              static_cast<size_t>(remoteRank) * bytesPerRank,
+          stream);
+      if (result != ncclSuccess) return result;
+    } else {
+      auto* recv = static_cast<char*>(recvbuff);
+      mscclpp::lite::CpuSwitch<char>{}
+          .enqueueCopy<mscclpp::lite::MemoryType::HostPinned,
+                       mscclpp::lite::MemoryType::Device, char const>(
+              {ctx.sendSlab + slotOffset, fullBytes}, {recv, fullBytes}, stream);
+    }
+    return ncclSuccess;
+}
+
+
+
+ncclResult_t executeNumaSchedule(std::vector<AgContext*> const& groups, NicGroupLayout const& layout, void const* sendbuff, void* recvbuff, size_t bytesPerRank, cudaStream_t stream, std::shared_ptr<Communicator> bootstrapComm) {
+  int rank = groups[0]->rank;
+  int nRanksPerNode = groups[0]->nRanksPerNode;
+    int localRank = rank % nRanksPerNode;
+    int ownGroupId = groupForLocalRank(layout, localRank);
+    AgContext& own = *groups[ownGroupId];
+    ensurePipelineStreams(own);
+    MSCCLPP_CUDATHROW(cudaEventRecord(own.inputReadyEvent, stream));
+    MSCCLPP_CUDATHROW(cudaStreamWaitEvent(own.d2hStream,
+                                          own.inputReadyEvent, 0));
+    MSCCLPP_CUDATHROW(cudaStreamWaitEvent(own.h2dStream,
+                                          own.inputReadyEvent, 0));
+    auto const* send = static_cast<char const*>(sendbuff);
+    auto* recv = static_cast<char*>(recvbuff);
+    bool selfInPlace =
+        send == recv + static_cast<size_t>(rank) * bytesPerRank;
+    bool selfPreCopied = false;
+    if (!selfInPlace && bytesPerRank >= kDirectSelfCopyMinBytes) {
+      mscclpp::lite::CpuSwitch<char>{}
+          .enqueueCopy<mscclpp::lite::MemoryType::Device,
+                       mscclpp::lite::MemoryType::Device, char const>(
+              {send, bytesPerRank},
+              {recv + static_cast<size_t>(rank) * bytesPerRank, bytesPerRank},
+              own.h2dStream);
+      selfPreCopied = true;
+    }
+
+    // Medium/large messages are bandwidth-bound: split local ranks across the
+    // available NIC groups so each group moves a contiguous host slab.
+    for (size_t chunkOffset = 0; chunkOffset < bytesPerRank;) {
+      size_t chunkBytes =
+          std::min(groups[ownGroupId]->chunkCapacity,
+                   bytesPerRank - chunkOffset);
+      std::vector<uint64_t> epochs(layout.count);
+      std::vector<size_t> blockBytes(layout.count);
+      std::vector<size_t> slotBlockBytes(layout.count);
+      std::vector<size_t> slotCounts(layout.count);
+      std::vector<size_t> slots(layout.count);
+      std::vector<bool> useAck(layout.count);
+      std::vector<size_t> sendBases(layout.count);
+      std::vector<size_t> recvBases(layout.count);
+      bool needSlotReuseBarrier = false;
+      for (int groupId = 0; groupId < layout.count; ++groupId) {
+        epochs[groupId] = ++groups[groupId]->epoch;
+        blockBytes[groupId] =
+            static_cast<size_t>(groups[groupId]->groupSize) * chunkBytes;
+        size_t slotBytes = bytesPerRank > groups[groupId]->chunkCapacity
+                               ? groups[groupId]->chunkCapacity
+                               : chunkBytes;
+        slotBlockBytes[groupId] =
+            static_cast<size_t>(groups[groupId]->groupSize) * slotBytes;
+        slotCounts[groupId] = slotCountForChunk(*groups[groupId], slotBytes);
+        slots[groupId] =
+            static_cast<size_t>((epochs[groupId] - 1) % slotCounts[groupId]);
+        useAck[groupId] = slotCounts[groupId] == 1;
+        needSlotReuseBarrier |=
+            !useAck[groupId] && slots[groupId] == 0 && epochs[groupId] > 1;
+        sendBases[groupId] =
+            sendSlotOffset(slots[groupId], slotBlockBytes[groupId]);
+        recvBases[groupId] = recvSlotOffset(slots[groupId],
+                                            groups[groupId]->nodeCount,
+                                            slotBlockBytes[groupId]);
+      }
+      if (needSlotReuseBarrier) {
+        MSCCLPP_CUDATHROW(cudaStreamSynchronize(own.h2dStream));
+        bootstrapComm->bootstrap()->barrier();
+      }
+
+      int ownSlot = own.localRank - own.groupBase;
+      mscclpp::lite::CpuSwitch<char>{}
+          .enqueueCopy<mscclpp::lite::MemoryType::Device,
+                       mscclpp::lite::MemoryType::HostPinned, char const>(
+              {send + chunkOffset, chunkBytes},
+              {own.sendSlab + sendBases[ownGroupId] +
+                   static_cast<size_t>(ownSlot) * chunkBytes,
+               chunkBytes},
+              own.d2hStream);
+      waitForCudaStream(own.d2hStream);
+      own.ctrl->d2hReady[own.localRank].store(epochs[ownGroupId],
+                                              std::memory_order_release);
+
+      if (own.isLeader) {
+        for (int i = 0; i < own.groupSize; ++i) {
+          waitForEpoch(own.ctrl->d2hReady[own.groupBase + i],
+                       epochs[ownGroupId]);
+        }
+        own.ctrl->rdmaSignal[own.nodeId].store(epochs[ownGroupId],
+                                               std::memory_order_release);
+        for (size_t peer = 0; peer < own.peerNodeIds.size(); ++peer) {
+          size_t remoteBase = recvBases[ownGroupId] +
+                              recvBlockOffset(own.nodeId,
+                                              slotBlockBytes[ownGroupId]);
+          size_t off = 0;
+          int writesSinceFlush = 0;
+          while (off < blockBytes[ownGroupId]) {
+            size_t chunk =
+                std::min(kRdmaChunkBytes, blockBytes[ownGroupId] - off);
+            own.peerConnections[peer].write(
+                own.peerRemoteRecvMemory[peer], remoteBase + off,
+                own.sendMemory, sendBases[ownGroupId] + off, chunk);
+            if (++writesSinceFlush == kSignalEveryN) {
+              own.peerConnections[peer].flush();
+              writesSinceFlush = 0;
+            }
+            off += chunk;
+          }
+          signalRdmaReadyAtomic(own, peer, epochs[ownGroupId]);
+        }
+      }
+
+      for (int groupId = 0; groupId < layout.count; ++groupId) {
+        for (int peerNode : groups[groupId]->peerNodeIds) {
+          waitForEpoch(groups[groupId]->ctrl->rdmaReady[peerNode],
+                       epochs[groupId]);
+        }
+      }
+      for (int groupId = 0; groupId < layout.count; ++groupId) {
+        auto& group = *groups[groupId];
+        for (int i = 0; i < group.groupSize; ++i) {
+          waitForEpoch(group.ctrl->d2hReady[group.groupBase + i],
+                       epochs[groupId]);
+        }
+      }
+      for (int groupId = 0; groupId < layout.count; ++groupId) {
+        ncclResult_t result = copyGroupChunkToOutput(
+            *groups[groupId], sendbuff, recvbuff, bytesPerRank, chunkOffset,
+            chunkBytes, sendBases[groupId], recvBases[groupId],
+            slotBlockBytes[groupId], own.h2dStream, selfPreCopied);
+        if (result != ncclSuccess) return result;
+      }
+      bool anyUseAck = false;
+      for (int groupId = 0; groupId < layout.count; ++groupId) {
+        if (useAck[groupId]) {
+          anyUseAck = true;
+        }
+      }
+      if (anyUseAck) {
+        MSCCLPP_CUDATHROW(cudaStreamSynchronize(own.h2dStream));
+      }
+      for (int groupId = 0; groupId < layout.count; ++groupId) {
+        if (useAck[groupId]) {
+          groups[groupId]->ctrl->h2dDone[localRank].store(
+              epochs[groupId], std::memory_order_release);
+        }
+      }
+
+      if (useAck[ownGroupId] && own.isLeader) {
+        for (int i = 0; i < nRanksPerNode; ++i) {
+          waitForEpoch(own.ctrl->h2dDone[i], epochs[ownGroupId]);
+        }
+        own.ctrl->ackSignal[own.nodeId].store(epochs[ownGroupId],
+                                              std::memory_order_release);
+        for (size_t peer = 0; peer < own.peerNodeIds.size(); ++peer) {
+          own.peerConnections[peer].write(
+              own.peerRemoteCtrlMemory[peer], ackReadyOffset(own.nodeId),
+              own.ctrlMemory, ackSignalOffset(own.nodeId), sizeof(uint64_t));
+          own.peerConnections[peer].flush();
+        }
+      }
+
+      for (int groupId = 0; groupId < layout.count; ++groupId) {
+        if (useAck[groupId]) {
+          for (int peerNode : groups[groupId]->peerNodeIds) {
+            waitForEpoch(groups[groupId]->ctrl->ackReady[peerNode],
+                         epochs[groupId]);
+          }
+        }
+      }
+      chunkOffset += chunkBytes;
+    }
+    MSCCLPP_CUDATHROW(cudaEventRecord(own.h2dDoneEvent, own.h2dStream));
+    MSCCLPP_CUDATHROW(cudaStreamWaitEvent(stream, own.h2dDoneEvent, 0));
+    return ncclSuccess;
+}
+
+
+
+// GPU-private ownership. Device initialization prepares every resource.
+struct DeviceNetworkOwner {
+  std::unique_ptr<AgContext> single;
+  std::array<std::unique_ptr<AgContext>, kMaxNicGroups> ownedGroups;
+  std::vector<AgContext*> groups;
+  NicGroupLayout layout{};
+  std::shared_ptr<Communicator> bootstrap;
+  size_t capacity = 0;
+  bool mapped = false;
+};
+
+}  // namespace
+
+
+void* prepareDeviceAllGatherNetwork(ncclComm_t comm,
+    std::shared_ptr<Communicator> bootstrap, int rank, int nranks,
+    int ranksPerNode, int cudaDevice, size_t capacity, int* groupCount) {
+  auto owner = std::make_unique<DeviceNetworkOwner>();
+  owner->bootstrap = bootstrap;
+  owner->capacity = capacity;
+  // Only a namespace nonce; getContext never dereferences this handle.
+  auto key = reinterpret_cast<ncclComm_t>(owner.get());
+  getContext([&]() -> std::unique_ptr<AgContext>& { return owner->single; },
+      key, bootstrap, rank, nranks, ranksPerNode, cudaDevice,
+      0, 0, ranksPerNode, cudaDevice, false, "device AllGather");
+  std::vector<int> mappings(nranks);
+  mappings[rank] = owner->single->sendDeviceSlab && owner->single->ctrlDeviceSlab;
+  bootstrap->bootstrap()->allGather(mappings.data(), sizeof(int));
+  owner->mapped = std::all_of(mappings.begin(), mappings.end(), [](int value) { return value != 0; });
+  owner->layout = getNicGroupLayout(comm, bootstrap, rank, nranks,
+                                    ranksPerNode, cudaDevice);
+  if (ranksPerNode > 2 && owner->layout.count > 1) {
+    for (int g = 0; g < owner->layout.count; ++g) {
+      auto& ctx = getContext(
+          [&]() -> std::unique_ptr<AgContext>& { return owner->ownedGroups[g]; },
+          key, bootstrap, rank, nranks, ranksPerNode, cudaDevice, g,
+          owner->layout.base[g], owner->layout.size[g],
+          owner->layout.transportDevice[g], true, "device NUMA AllGather");
+      owner->groups.push_back(&ctx);
+    }
+  }
+  ncclResult_t result = ncclSuccess;
+  std::string message;
+  try {
+    ensurePipelineStreams(*owner->single);
+    // Bounds cover every selected generic/full-message slot count. Calls to
+    // ensure* in shared schedules are now no-ops, including after size changes.
+    ensureSlotEvents(*owner->single, 1024);
+    if (ranksPerNode == 1) {
+      size_t bytes = std::min(capacity, kOneRankPipelineMaxBytes);
+      ensureD2hChunkEvents(*owner->single,
+          (bytes + kOneRankPipelineChunkBytes - 1) / kOneRankPipelineChunkBytes);
+    }
+    for (auto* group : owner->groups) {
+      ensurePipelineStreams(*group);
+      ensureSlotEvents(*group, 1024);
+    }
+  } catch (std::exception const& e) {
+    result = mapException(e);
+    message = e.what();
+  }
+  publishInitStatus(bootstrap, rank, nranks, result, message,
+                    "device AllGather streams/events");
+  *groupCount = owner->groups.empty() ? 1 : static_cast<int>(owner->groups.size());
+  return owner.release();
+}
+
+void executeDeviceAllGatherNetwork(void* opaque, LiteTask const& task,
+    uint64_t sequence, LiteNetworkControl* control, cudaStream_t stream) {
+  auto& owner = *static_cast<DeviceNetworkOwner*>(opaque);
+  struct WaitScope {
+    LiteNetworkControl* previous;
+    explicit WaitScope(LiteNetworkControl* call) : previous(activeDeviceCall) {
+      activeDeviceCall = call;
+    }
+    ~WaitScope() { activeDeviceCall = previous; }
+  } scope(control);
+  checkDeviceAllGatherAbort();
+  control->mapped = owner.mapped;
+  if (!task.source || !task.destination || !task.bytes || task.bytes > owner.capacity)
+    throw mscclpp::Error("invalid device network AllGather", mscclpp::ErrorCode::InvalidUsage);
+  auto const* src = reinterpret_cast<void const*>(task.source);
+  auto* dst = reinterpret_cast<void*>(task.destination);
+  auto& ctx = *owner.single;
+  ncclResult_t result = ncclInvalidUsage;
+  switch (task.networkPath) {
+    case LiteDeviceAllGatherPath::OrderedSmall:
+      result = executeOrderedSmallSchedule(ctx, src, dst, task.bytes, stream,
+                                            owner.bootstrap, control, sequence);
+      if ((result == ncclInvalidUsage || result == ncclInvalidArgument) &&
+          __atomic_load_n(&control->prepared, __ATOMIC_ACQUIRE) < sequence) {
+        control->oneRankRegister = control->stageWithSm = control->receiveWithSm = false;
+        __atomic_store_n(&control->prepared, sequence, __ATOMIC_RELEASE);
+        result = executeSmallFallbackSchedule(ctx, src, dst, task.bytes, stream);
+      }
+      break;
+    case LiteDeviceAllGatherPath::SmallFallback:
+      result = executeSmallFallbackSchedule(ctx, src, dst, task.bytes, stream);
+      break;
+    case LiteDeviceAllGatherPath::OneRankPipeline:
+    case LiteDeviceAllGatherPath::SingleSlab:
+      result = executeSingleSlabSchedule(ctx, src, dst, task.bytes, stream,
+                                          owner.bootstrap);
+      break;
+    case LiteDeviceAllGatherPath::NumaSplit:
+      if (!owner.groups.empty())
+        result = executeNumaSchedule(owner.groups, owner.layout, src, dst,
+                                      task.bytes, stream, owner.bootstrap);
+      break;
+    default: break;
+  }
+  if (result != ncclSuccess)
+    throw mscclpp::Error("device network AllGather schedule failed",
+                         mscclpp::ErrorCode::InvalidUsage);
+  // This stream is independent of the waiting user kernel. The shared DMA
+  // schedules join their private streams into it, exactly as for a CPU caller.
+  waitForCudaStream(stream);
+  if (task.networkPath == LiteDeviceAllGatherPath::OrderedSmall)
+    while (__atomic_load_n(&control->deviceDone, __ATOMIC_ACQUIRE) < sequence) {
+      if (__atomic_load_n(&control->abort, __ATOMIC_ACQUIRE))
+        throw mscclpp::Error("device AllGather aborted", mscclpp::ErrorCode::SystemError);
+      std::this_thread::yield();
+    }
+}
+
+void releaseDeviceAllGatherNetwork(void* opaque) {
+  std::unique_ptr<DeviceNetworkOwner> owner(static_cast<DeviceNetworkOwner*>(opaque));
+  if (!owner) return;
+  auto drain = [](AgContext& ctx) {
+    if (ctx.d2hStream) cudaStreamSynchronize(ctx.d2hStream);
+    if (ctx.h2dStream) cudaStreamSynchronize(ctx.h2dStream);
+    pollQp(ctx);
+  };
+  try {
+    drain(*owner->single);
+    for (auto* group : owner->groups) drain(*group);
+  } catch (...) {
+    // Destruction must not throw from DeviceCollectiveContext's destructor.
+  }
+}
+
+
+}  // namespace nccl
+}  // namespace mscclpp
