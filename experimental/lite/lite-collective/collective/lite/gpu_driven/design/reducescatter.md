@@ -38,7 +38,8 @@ Operations that need the CPU, the copy engines or the NIC are FIFO primitives ex
 | `liteRsCopyAsync` / `liteRsAwait` (`RsCopy`) | service stream (DMA) | 1D or 2D copy between any two UVA addresses: D2D over IPC, D2H, H2D. Streams 0–3 allow parallel copies                   |
 | `liteRsHostSum` (`RsHostSum`)                  | service CPU          | float sum of up to four pinned-host rows into a host row (AVX-512 or scalar)                                              |
 | `liteRsBarrier` (`RsBarrier`)                  | service              | publish this rank's epoch in a control row of the node's host slab and wait for all local ranks                           |
-| `liteRsSum`                                      | CTA threads          | elementwise float sum of up to four rows in peer scratch / mapped host / input; volatile loads, system fence, CTA barrier |
+| `liteRsSum`                                      | CTA threads          | elementwise float sum of up to four rows in peer scratch / mapped host / input; 16-byte uncached loads with 4 independent loads per thread in flight (scalar fallback for unaligned rows), system fence, CTA barrier |
+| `liteRsSignalFlag` / `liteRsWaitFlag`            | CTA thread 0         | neighbour hand-over through a control word in mapped host memory (release store / acquire wait), no FIFO round trip; used by HostRing |
 | `liteRsEpochLoad` / `liteRsEpochStore`         | CTA thread 0         | persistent barrier epoch in the FIFO control page                                                                         |
 
 Row addresses come from `LiteRsDeviceView` (peer GPU scratch pointers, CPU and device-mapped addresses of the host slab) using the same `LiteRsLayout` offset functions as the service. The two-node paths are not decomposed yet: they submit one whole-invocation `ReduceScatter` task and the CPU schedule requests the CTA phases (like AllGather's `NetworkAllGather`).
@@ -143,9 +144,12 @@ are easy to get wrong. They are implemented in `reducescatter_ipc.cuh` and
   independent ready/consume epochs, and tail chunks are preserved.
 * **HostRing phases**: each rank owns `P-1` mapped-host rows per chunk. Phase 0 copies shard
   `me-1` into row 0; phase `k` (1 ≤ k ≤ P-2) writes `row[k] = shard(me-1-k) + prev.row[k-1]`;
-  the final phase writes `shard(me) + prev.row[P-2]` to the output. Each phase is followed
-  by a local barrier, and a final barrier lets the next chunk rewrite the rows. The ring
-  area of the scratch stride holds three rows.
+  the final phase writes `shard(me) + prev.row[P-2]` to the output. The hand-over uses
+  neighbour flags in the mapped control page, with no FIFO task: after finishing row `k` a
+  rank release-stores the chunk epoch in `flag[k][me]` and the next rank acquires it before
+  reading; after the final phase it stores `flag[3][me]`, which the previous rank waits for
+  (with epoch − 1) before rewriting its rows for the next chunk. Only the neighbour is waited
+  for, like the CPU's stream flags. The ring area of the scratch stride holds three rows.
 * **Chunking and slots**: IPC/host ring chunks default to 16 MiB; local rows/bulk default to
   2 MiB. Local scratch uses one chunk slot. The CPU reference's multi-slot / IPC-event
   mechanism is replaced by independent stream completion plus an epoch barrier; no
@@ -259,8 +263,8 @@ publication, without waiting for the stream that runs the user kernel to finish.
 * LocalRows small-message device-flag scatter is a CTA scatter followed by a service
   `RsBarrier`, not the CPU's single scatter kernel that also waits on device flags: the
   peer wait is a CPU-executed barrier task.
-* Every single-node barrier is a FIFO round trip to the service (all-rank barrier),
-  where the CPU paths use event / flag waits between GPU kernels.
+* Every single-node barrier except HostRing's neighbour flags is a FIFO round trip to the
+  service (all-rank barrier), where the CPU paths use event / flag waits between GPU kernels.
 * The CPU's default multi-HCA round-robin for 2n×2g messages ≤ 2 MiB depends on the
   first call's size, while GPU connections are created at initialization; only the
   locality-based NIC choice is used.

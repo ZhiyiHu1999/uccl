@@ -90,13 +90,17 @@ static __device__ __forceinline__ int liteRsHostRowsBlock(
 //   row[0]   = shard(me-1)
 //   row[k]   = shard(me-1-k) + prev.row[k-1]      (1 <= k <= n-2)
 //   output   = shard(me)     + prev.row[n-2]
-// Barriers order the row hand-over; the last one frees the rows for the next
-// chunk.
+// The hand-over uses neighbour flags in the mapped control page, so the whole
+// path runs on the device without a FIFO task (like the CPU's stream flags):
+//   flag[k][me]  = chunk epoch once row k is complete (prev waits for it);
+//   flag[3][me]  = chunk epoch once this rank has read prev's rows (prev may then
+//                  rewrite them for the next chunk; waited before row 0).
 static __device__ __forceinline__ int liteRsHostRingBlock(
     mscclppDeviceCollectiveHandle_t const& h, float const* srcF, float* dstF,
     size_t B, LiteReduceScatterPlan const& plan) {
   auto const& v = h.reduceScatterView;
-  int n = v.layout.local, me = v.layout.me, prev = (me + n - 1) % n;
+  int n = v.layout.local, me = v.layout.me, prev = (me + n - 1) % n,
+      next = (me + 1) % n;
   auto const* src = reinterpret_cast<char const*>(srcF);
   auto* dst = reinterpret_cast<char*>(dstF);
   unsigned long long e = liteRsEpochLoad(h);
@@ -106,20 +110,24 @@ static __device__ __forceinline__ int liteRsHostRingBlock(
     auto shard = [&](int k) {
       return src + static_cast<size_t>(((me - k) % n + n) % n) * B + off;
     };
+    // The reader of my rows (next) finished the previous chunk.
+    int rc = liteRsWaitFlag(h, v.flag(0, 3, next), e - 1);
+    if (rc) return rc;
     char const* first[1] = {shard(1)};
     liteRsSum(v.ringRow(0, me, 0, true), first, 1, bytes);
-    int rc = liteRsBarrier(h, 0, e);
-    if (rc) return rc;
+    liteRsSignalFlag(v.flag(0, 0, me), e);
     for (int k = 1; k <= n - 2; ++k) {
+      rc = liteRsWaitFlag(h, v.flag(0, k - 1, prev), e);
+      if (rc) return rc;
       char const* rows[2] = {shard(k + 1), v.ringRow(0, prev, k - 1, true)};
       liteRsSum(v.ringRow(0, me, k, true), rows, 2, bytes);
-      rc = liteRsBarrier(h, k, e);
-      if (rc) return rc;
+      liteRsSignalFlag(v.flag(0, k, me), e);
     }
+    rc = liteRsWaitFlag(h, v.flag(0, n - 2, prev), e);
+    if (rc) return rc;
     char const* last[2] = {shard(n), v.ringRow(0, prev, n - 2, true)};
     liteRsSum(dst + off, last, 2, bytes);
-    rc = liteRsBarrier(h, 3, e);
-    if (rc) return rc;
+    liteRsSignalFlag(v.flag(0, 3, me), e);
     off += bytes;
   }
   liteRsEpochStore(h, e);

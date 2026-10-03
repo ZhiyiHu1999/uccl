@@ -220,6 +220,20 @@ static void debugProbeHandle(mscclppDeviceCollectiveHandle_t const& handle,
   MPI_Barrier(MPI_COMM_WORLD);
 }
 
+// Threads of the single participating CTA. The SM budget is one CTA; the thread
+// count only changes how much memory-level parallelism that CTA has. Override
+// with UCCL_GPU_DRIVEN_BENCH_THREADS (multiple of 32, at most 1024).
+static int benchThreads() {
+  static int threads = [] {
+    char const* value = std::getenv("UCCL_GPU_DRIVEN_BENCH_THREADS");
+    long parsed = value ? std::strtol(value, nullptr, 10) : 256;
+    return (parsed >= 32 && parsed <= 1024 && parsed % 32 == 0)
+               ? static_cast<int>(parsed)
+               : 256;
+  }();
+  return threads;
+}
+
 __global__ void allGatherBenchKernel(mscclppDeviceCollectiveHandle_t handle,
                                      float const* input, float* output,
                                      size_t count, int* status) {
@@ -264,13 +278,13 @@ static Sample launchGpuDrivenOnce(BenchCollective collective,
   switch (collective) {
     case BenchCollective::AllGather:
       // Deliberately one block/SM, including the grid-capable HostCooperative path.
-      allGatherBenchKernel<<<1, 256>>>(handle, input, output, count, status);
+      allGatherBenchKernel<<<1, benchThreads()>>>(handle, input, output, count, status);
       break;
     case BenchCollective::AllReduce:
-      allReduceBenchKernel<<<1, 256>>>(handle, input, output, count, status);
+      allReduceBenchKernel<<<1, benchThreads()>>>(handle, input, output, count, status);
       break;
     case BenchCollective::ReduceScatter:
-      reduceScatterBenchKernel<<<1, 256>>>(handle, input, output, count,
+      reduceScatterBenchKernel<<<1, benchThreads()>>>(handle, input, output, count,
                                            status);
       break;
   }
@@ -430,7 +444,7 @@ static void runComparison(BenchCollective collective, size_t bytes, int warmups,
   if (collective == BenchCollective::AllGather) {
     for (bool inPlace : {false, true})
       for (int unaligned : {0, 1}) {
-        checkGather<<<1, 256>>>(handle,
+        checkGather<<<1, benchThreads()>>>(handle,
                                 reinterpret_cast<char*>(input) + unaligned,
                                 reinterpret_cast<char*>(output) + unaligned,
                                 bytes, inPlace, errors);
@@ -446,13 +460,13 @@ static void runComparison(BenchCollective collective, size_t bytes, int warmups,
         float* source = input;
         if (collective == BenchCollective::AllReduce && inPlace && ipcOutput)
           source = output;
-        checkReduction<<<1, 256>>>(handle, source, output, count,
+        checkReduction<<<1, benchThreads()>>>(handle, source, output, count,
                                    collective == BenchCollective::ReduceScatter,
                                    inPlace, op, errors);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
         if (!handle.reductionsMapped) continue;
-        checkReduction<<<1, 256>>>(handle, reinterpret_cast<int*>(source),
+        checkReduction<<<1, benchThreads()>>>(handle, reinterpret_cast<int*>(source),
                                    reinterpret_cast<int*>(output), count,
                                    collective == BenchCollective::ReduceScatter,
                                    inPlace, op, errors);
@@ -475,7 +489,7 @@ static void runComparison(BenchCollective collective, size_t bytes, int warmups,
   }
   CUDA_CHECK(cudaFree(errors));
   if (collective == BenchCollective::AllGather)
-    initializeBytes<<<1, 256>>>(reinterpret_cast<unsigned char*>(input), bytes,
+    initializeBytes<<<1, benchThreads()>>>(reinterpret_cast<unsigned char*>(input), bytes,
                                 rank);
   else
     initializeFloats<<<std::min<size_t>(128, (inputCount + 255) / 256), 256>>>(

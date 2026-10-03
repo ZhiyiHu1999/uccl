@@ -46,6 +46,15 @@ run: in particular check the new FIFO primitive kinds, the device-mapped row add
 (`LiteRsLayout`), per-target `RsCopy` streams, and barrier/epoch handling across
 repeated calls with different sizes.
 
+## HostRing throughput changes (2026-10-03)
+
+`liteRsSum` now uses 16-byte uncached loads with four independent loads per thread, and
+HostRing replaces its FIFO barriers with neighbour flags in the mapped control page. The
+benchmark takes `UCCL_GPU_DRIVEN_BENCH_THREADS` (multiple of 32, default 256, at most 1024)
+for the thread count of the single CTA; the SM budget stays one block. Not compiled or run:
+compare HostRing at 1 MiB..1 GiB with 256 and 1024 threads. A previous measurement with
+stuck processes holding the GPUs (NCCL itself ten times slower) must not be used as baseline.
+
 ## Target-machine benchmark matrix
 
 Use the existing benchmark; it performs untimed correctness preflight before

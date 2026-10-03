@@ -51,16 +51,52 @@ enum class LiteReduceScatterPath {
   HierarchicalFour,
   HostStaged
 };
+// Output of litePlanReduceScatter. B = output shard bytes per rank. Flags below
+// only matter for the two-node paths unless noted; they mirror the CPU
+// reference's per-layout defaults (see design/reducescatter.md).
 struct LiteReduceScatterPlan {
   LiteReduceScatterPath path = LiteReduceScatterPath::Unsupported;
+  // path: Selected optimization path; Unsupported means the request is rejected.
   size_t chunkBytes = 0;
-  unsigned slots = 1, lead = 0;
-  bool deviceFlags = false, directPartner = false, partner2d = false;
-  bool mappedSend = false, hostFinal = false, splitFinal = false;
+  // chunkBytes: Bytes of one chunk of the output shard handled per iteration (a
+  //   multiple of sizeof(float)); the last chunk may be shorter. Equals B for a
+  //   single chunk.
+  unsigned slots = 1;
+  // slots: Pipeline slots for chunks in flight: 5 for 2n*1g, 4 for the other
+  //   two-node layouts, 1 for single-node paths.
+  unsigned lead = 0;
+  // lead: Chunks the local phases run ahead before the oldest is posted or
+  //   completed; 0 = strictly sequential; always <= slots - 1.
+  bool deviceFlags = false;
+  // deviceFlags: LocalRows, small B: the CTA scatters straight into the peers'
+  //   scratch instead of submitting DMA (needs mapped slabs).
+  bool directPartner = false;
+  // directPartner: Hierarchical: DMA the rows the partner needs straight into
+  //   its scratch; false packs them in the own scratch first, then pushes them.
+  bool partner2d = false;
+  // partner2d: Hierarchical: copy the strided odd/even partner rows with one 2D
+  //   copy instead of one copy per row.
+  bool mappedSend = false;
+  // mappedSend: The CTA writes the remote-owned partial straight into the mapped
+  //   send slab instead of leaving it in GPU scratch for a D2H copy.
+  bool hostFinal = false;
+  // hostFinal: The final add reads the incoming remote partial directly from the
+  //   mapped receive slab, skipping the H2D copy.
+  bool splitFinal = false;
+  // splitFinal: Compute the remote-owned partial first and start its D2H, then
+  //   compute the local partial while that copy runs.
   bool asyncFinal = false;
-  // Mirrors CPU recordAsyncD2h: pipelined chunks, or the 2n*2g async single
-  // chunk (B <= 512 KiB). Synchronous single chunks may use CPU_FINAL_ADD.
-  bool recordAsync = false, cpuFinal = false, eagerPost = false;
+  // asyncFinal: Prefetch the incoming remote contribution (H2D) as soon as it
+  //   arrives, overlapping with the CTA phases of later chunks.
+  bool recordAsync = false;
+  // recordAsync: Mirrors CPU recordAsyncD2h: pipelined chunks, or the 2n*2g async
+  //   single chunk (B <= 512 KiB).
+  bool cpuFinal = false;
+  // cpuFinal: Synchronous single chunk: D2H the local partial and do the final
+  //   add on the CPU (CPU_FINAL_ADD).
+  bool eagerPost = false;
+  // eagerPost: Post a chunk's RDMA `lead` chunks behind preparation instead of
+  //   right before completing it; only for pipelined 2n*2g / 2n*4g.
 };
 LITE_RS_HD inline size_t liteRsLead(size_t configured, size_t fallback) {
   return configured == ~size_t{0} ? fallback : configured;
@@ -121,8 +157,8 @@ LITE_RS_HD inline LiteReduceScatterPlan litePlanReduceScatter(
       p.path = LiteReduceScatterPath::LocalRows;
       p.deviceFlags = mapped && bytes <= q.deviceFlagMax;
     }
-  } else {
-    p.slots = local == 1 ? 5 : 4;
+  } else {  // two nodes
+    p.slots = local == 1 ? 5 : 4;  // 2n * 1g
     bool mappedSendMode =
         q.mappedSend >= 0 ? q.mappedSend != 0 : bytes <= 1024 * 1024;
     size_t chunk = bytes <= 2 * 1024 * 1024 ? 512 * 1024 : 1024 * 1024;

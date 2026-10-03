@@ -83,16 +83,53 @@ static __device__ __forceinline__ int liteRsBarrier(
 }
 
 // CTA arithmetic. Inputs may live in peer GPU scratch or mapped host memory and
-// may be rewritten by other agents between calls, so loads are volatile. The
-// output may alias one input (in-place ring accumulation).
+// may be rewritten by other agents between calls, so loads bypass the caches
+// (ld.global.cv). Host-mapped rows are far away (about a microsecond per PCIe
+// read), so throughput is bounded by how many bytes are in flight: with 16-byte
+// loads and kUnroll independent loads per thread a single CTA keeps
+// threads * 16 * kUnroll bytes outstanding instead of threads * 4. The output
+// may alias one input (in-place ring accumulation): every element is read before
+// it is written by the same thread. Unaligned rows use the scalar loop.
 static __device__ __forceinline__ void liteRsSum(char* dst,
                                                  char const* const* rows,
                                                  int n, size_t bytes) {
+  constexpr int kUnroll = 4;
   unsigned tid = mscclppDeviceCollectiveThreadId();
   unsigned threads = mscclppDeviceCollectiveThreadCount();
   size_t count = bytes / sizeof(float);
+  uintptr_t alignment = reinterpret_cast<uintptr_t>(dst);
+  for (int r = 0; r < n; ++r) alignment |= reinterpret_cast<uintptr_t>(rows[r]);
+  size_t vecCount = (alignment & 15) == 0 ? count / 4 : 0;
+  auto* out4 = reinterpret_cast<float4*>(dst);
+  for (size_t base = tid; base < vecCount;
+       base += static_cast<size_t>(threads) * kUnroll) {
+    float4 acc[kUnroll];
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) {
+      size_t i = base + static_cast<size_t>(u) * threads;
+      if (i < vecCount) acc[u] = __ldcv(reinterpret_cast<float4 const*>(rows[0]) + i);
+    }
+    for (int r = 1; r < n; ++r) {
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u) {
+        size_t i = base + static_cast<size_t>(u) * threads;
+        if (i < vecCount) {
+          float4 t = __ldcv(reinterpret_cast<float4 const*>(rows[r]) + i);
+          acc[u].x += t.x;
+          acc[u].y += t.y;
+          acc[u].z += t.z;
+          acc[u].w += t.w;
+        }
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) {
+      size_t i = base + static_cast<size_t>(u) * threads;
+      if (i < vecCount) out4[i] = acc[u];
+    }
+  }
   auto* out = reinterpret_cast<float*>(dst);
-  for (size_t i = tid; i < count; i += threads) {
+  for (size_t i = vecCount * 4 + tid; i < count; i += threads) {
     float value = reinterpret_cast<float const volatile*>(rows[0])[i];
     for (int r = 1; r < n; ++r)
       value += reinterpret_cast<float const volatile*>(rows[r])[i];
@@ -101,6 +138,29 @@ static __device__ __forceinline__ void liteRsSum(char* dst,
   // Make the result visible to peers / the CPU before any barrier is posted.
   __threadfence_system();
   __syncthreads();
+}
+
+// Neighbour hand-over through the control page in mapped host memory, with no
+// FIFO round trip: the owner publishes with a system-scope release store after
+// liteRsSum made its rows visible, the reader acquires. Both poison the handle
+// on timeout / failure like every other wait.
+static __device__ __forceinline__ void liteRsSignalFlag(
+    unsigned long long* flag, unsigned long long epoch) {
+  if (mscclppDeviceCollectiveThreadId() == 0) liteStoreRelease(flag, epoch);
+  __syncthreads();
+}
+
+static __device__ __forceinline__ int liteRsWaitFlag(
+    mscclppDeviceCollectiveHandle_t const& h, unsigned long long* flag,
+    unsigned long long epoch) {
+  __shared__ int status;
+  __syncthreads();
+  if (mscclppDeviceCollectiveThreadId() == 0)
+    status = liteCollectiveWait(h, flag, epoch)
+                 ? mscclppDeviceCollectiveSuccess
+                 : mscclppDeviceCollectiveTransportError;
+  __syncthreads();
+  return status;
 }
 
 // Persistent barrier epoch of the device-composed paths.

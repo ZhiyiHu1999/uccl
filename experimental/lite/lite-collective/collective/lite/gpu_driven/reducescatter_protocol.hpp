@@ -76,6 +76,14 @@ struct LiteRsDeviceView {
                                     unsigned row = 0) const {
     return peers[q] + layout.scratchOffset(slot, row);
   }
+  // Control word value[slot][kind][rank] of the node's shared control page (the
+  // first 4096 bytes of the host slab, uint64_t value[5][8][4]); needs the
+  // device mapping. Single-writer: only rank `rank` stores to it.
+  LITE_RS_LAYOUT_HD unsigned long long* flag(unsigned slot, unsigned kind,
+                                             int rank) const {
+    return reinterpret_cast<unsigned long long*>(hostSendDevice) +
+           (static_cast<size_t>(slot) * 8 + kind) * 4 + rank;
+  }
   LITE_RS_LAYOUT_HD char* ringRow(unsigned slot, int q, unsigned parity,
                                   bool onHost) const {
     return onHost ? mappedRow(slot, q) + layout.ringTail(parity)
