@@ -417,14 +417,38 @@ static void runComparison(BenchCollective collective, size_t bytes, int warmups,
     std::printf("allreduce bytes=%zu path=%s chunk_bytes=%zu\n", bytes,
                 liteAllReducePathName(plan.path), plan.chunkBytes);
   }
+  // The selected path is reported on the result line itself (pathInfo), so every
+  // measurement carries the path it measured. UCCL_GPU_DRIVEN_BENCH_VERBOSE=1
+  // also prints it before the run starts, which identifies the path of a hang.
+  std::string pathInfo;
   if (!rank && collective == BenchCollective::ReduceScatter) {
     auto plan = litePlanReduceScatter(handle.reduceScatterPolicy, nranks,
         handle.ranksPerNode, handle.maxBytesPerRank, bytes, true,
         handle.reduceScatterIpc, handle.reduceScatterMapped);
-    std::printf("reducescatter bytes_per_rank=%zu path=%s chunk_bytes=%zu slots=%u lead=%u "
-                "async=%d split=%d host_final=%d async_final=%d eager=%d\n",
-                bytes, liteReduceScatterPathName(plan.path), plan.chunkBytes, plan.slots, plan.lead,
-                plan.recordAsync, plan.splitFinal, plan.hostFinal, plan.asyncFinal, plan.eagerPost);
+    std::string opts;
+    auto add = [&](bool on, char const* name) {
+      if (on) opts += (opts.empty() ? "" : "+") + std::string(name);
+    };
+    add(plan.deviceFlags, "device_flags");
+    add(plan.directPartner, "direct_partner");
+    add(plan.partner2d, "partner_2d");
+    add(plan.mappedSend, "mapped_send");
+    add(plan.hostFinal, "host_final");
+    add(plan.splitFinal, "split_final");
+    add(plan.asyncFinal, "async_final");
+    add(plan.recordAsync, "record_async");
+    add(plan.cpuFinal, "cpu_final");
+    add(plan.eagerPost, "eager_post");
+    char buffer[256];
+    std::snprintf(buffer, sizeof(buffer),
+                  " path=%s chunk_bytes=%zu slots=%u lead=%u opts=%s",
+                  liteReduceScatterPathName(plan.path), plan.chunkBytes,
+                  plan.slots, plan.lead, opts.empty() ? "-" : opts.c_str());
+    pathInfo = buffer;
+    if (char const* verbose = std::getenv("UCCL_GPU_DRIVEN_BENCH_VERBOSE"))
+      if (verbose[0] && verbose[0] != '0')
+        std::fprintf(stderr, "reducescatter bytes_per_rank=%zu%s (starting)\n",
+                     bytes, pathInfo.c_str());
   }
   if (ipcOutput)
     NCCL_CHECK(mscclppRegisterDeviceCollectiveIpcOutput(
@@ -585,12 +609,13 @@ static void runComparison(BenchCollective collective, size_t bytes, int warmups,
     float gpuE2e = mean(gpuEndToEndTimes);
     float ncclE2e = mean(ncclEndToEndTimes);
     std::printf(
-        "%-14s bytes_per_rank=%-8zu "
+        "%-14s bytes_per_rank=%-8zu%s "
         "gpu_avg_device_us=%.3f gpu_avg_e2e_us=%.3f "
         "nccl_avg_device_us=%.3f nccl_avg_e2e_us=%.3f "
         "avg_speedup_e2e=%.3fx\n",
-        collectiveName(collective), bytes, mean(gpuDeviceTimes), gpuE2e,
-        mean(ncclDeviceTimes), ncclE2e, ncclE2e / gpuE2e);
+        collectiveName(collective), bytes, pathInfo.c_str(),
+        mean(gpuDeviceTimes), gpuE2e, mean(ncclDeviceTimes), ncclE2e,
+        ncclE2e / gpuE2e);
     std::fflush(stdout);
   }
 

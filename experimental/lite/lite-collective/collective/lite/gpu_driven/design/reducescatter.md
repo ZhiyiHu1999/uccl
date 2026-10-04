@@ -55,7 +55,7 @@ Initialization rejects three or more nodes: the multi-node schedule pairs each r
 
 ## CPU path correspondence
 
-The reference is `runLiteInterReduceScatter()` in `nccl/ReduceScatter/multi-node.cu`, together with the `single-node.cu` it includes. All thresholds below are defaults; KiB/MiB are binary. Within a group, rows are matched top to bottom. The benchmark prints the selected path, chunk, slots and lead.
+The reference is `runLiteInterReduceScatter()` in `nccl/ReduceScatter/multi-node.cu`, together with the `single-node.cu` it includes. All thresholds below are defaults; KiB/MiB are binary. Within a group, rows are matched top to bottom. The benchmark prints the selected path, chunk, slots, lead and enabled options on every ReduceScatter result line.
 
 ### Vocabulary
 

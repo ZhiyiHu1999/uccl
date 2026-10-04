@@ -177,16 +177,35 @@ awk -v selected="${SELECTED_COLLECTIVE}" '
       collective = order[section]
       if (selected != "all" && selected != collective) continue
       printf "\n## %s\n\n", title[collective]
-      print "| Bytes per rank | GPU avg device (us) | GPU avg E2E (us) | NCCL avg device (us) | NCCL avg E2E (us) | Avg E2E speedup |"
-      print "|---:|---:|---:|---:|---:|---:|"
+      # Rows that report the selected path (ReduceScatter) get a Path column.
+      hasPath = 0
+      for (row = 1; row <= count[collective]; ++row)
+        if (value[collective, row, "path"] != "") hasPath = 1
+      if (hasPath) {
+        print "| Bytes per rank | Path | Options | GPU avg device (us) | GPU avg E2E (us) | NCCL avg device (us) | NCCL avg E2E (us) | Avg E2E speedup |"
+        print "|---:|---|---|---:|---:|---:|---:|---:|"
+      } else {
+        print "| Bytes per rank | GPU avg device (us) | GPU avg E2E (us) | NCCL avg device (us) | NCCL avg E2E (us) | Avg E2E speedup |"
+        print "|---:|---:|---:|---:|---:|---:|"
+      }
       for (row = 1; row <= count[collective]; ++row) {
         speedup = value[collective, row, "avg_speedup_e2e"]
-        printf "| %s | %s | %s | %s | %s | %s |\n", \
-          value[collective, row, "bytes_per_rank"], \
-          value[collective, row, "gpu_avg_device_us"], \
-          value[collective, row, "gpu_avg_e2e_us"], \
-          value[collective, row, "nccl_avg_device_us"], \
-          value[collective, row, "nccl_avg_e2e_us"], speedup
+        if (hasPath)
+          printf "| %s | %s | %s | %s | %s | %s | %s | %s |\n", \
+            value[collective, row, "bytes_per_rank"], \
+            value[collective, row, "path"], \
+            value[collective, row, "opts"], \
+            value[collective, row, "gpu_avg_device_us"], \
+            value[collective, row, "gpu_avg_e2e_us"], \
+            value[collective, row, "nccl_avg_device_us"], \
+            value[collective, row, "nccl_avg_e2e_us"], speedup
+        else
+          printf "| %s | %s | %s | %s | %s | %s |\n", \
+            value[collective, row, "bytes_per_rank"], \
+            value[collective, row, "gpu_avg_device_us"], \
+            value[collective, row, "gpu_avg_e2e_us"], \
+            value[collective, row, "nccl_avg_device_us"], \
+            value[collective, row, "nccl_avg_e2e_us"], speedup
       }
     }
   }
@@ -202,10 +221,13 @@ if [[ "${SELECTED_COLLECTIVE}" == allreduce || "${SELECTED_COLLECTIVE}" == all ]
   } >>"${RESULT_FILE}"
 fi
 
-if [[ "${SELECTED_COLLECTIVE}" == reducescatter || "${SELECTED_COLLECTIVE}" == all ]]; then
+# The selected path is part of every ReduceScatter result row; keep only the
+# preflight coverage notes (for example generic int/min/max being unavailable).
+if [[ "${SELECTED_COLLECTIVE}" == reducescatter || "${SELECTED_COLLECTIVE}" == all ]] \
+    && grep -q '^reducescatter preflight coverage=' "${RAW_OUTPUT}"; then
   {
-    printf '\n## ReduceScatter paths\n\n```text\n'
-    awk '/^reducescatter / && (/path=/ || /preflight coverage=/)' "${RAW_OUTPUT}"
+    printf '\n## ReduceScatter notes\n\n```text\n'
+    grep '^reducescatter preflight coverage=' "${RAW_OUTPUT}"
     printf '```\n'
   } >>"${RESULT_FILE}"
 fi

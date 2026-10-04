@@ -83,8 +83,18 @@ NP=4 MSCCLPP_NCCL_RS_NO_CUDAIPC=1 \
 Repeat with NP=2 for 1n×2g. For two nodes set `HOSTS` to the actual two hostnames,
 `CUDA_VISIBLE_DEVICES` to 1, 2 or 4 devices per node, and NP to 2, 4 or 8.
 The script forwards exported `MSCCLPP_NCCL_RS_*` policy variables to MPI ranks;
-all ranks must agree. The executable and Markdown report record selected path,
-chunk bytes, slot count and lead.
+all ranks must agree. Every ReduceScatter result line carries the path it measured:
+
+```text
+reducescatter  bytes_per_rank=1048576  path=HostRing chunk_bytes=1048576 slots=1 lead=0 opts=- gpu_avg_device_us=... avg_speedup_e2e=...x
+```
+
+`opts` lists the enabled plan options joined by `+` (`device_flags`, `direct_partner`,
+`partner_2d`, `mapped_send`, `host_final`, `split_final`, `async_final`, `record_async`,
+`cpu_final`, `eager_post`) or `-`. The Markdown report's ReduceScatter table has `Path` and
+`Options` columns; a "ReduceScatter notes" section only appears for preflight coverage
+notes. Set `UCCL_GPU_DRIVEN_BENCH_VERBOSE=1` to also print the path to stderr before a size
+starts, which tells which path a hung or failing run was in.
 
 Run both mapping capabilities where the target supports them; force host bulk
 with `NO_CUDAIPC_HOST_READ=0` and `NO_CUDAIPC_DIRECT_RING=0`. Vary
