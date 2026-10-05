@@ -608,6 +608,10 @@ static void runComparison(BenchCollective collective, size_t bytes, int warmups,
   if (rank == 0) {
     float gpuE2e = mean(gpuEndToEndTimes);
     float ncclE2e = mean(ncclEndToEndTimes);
+    // Blank line between consecutive result lines (one per message size).
+    static bool printedResult = false;
+    if (printedResult) std::printf("\n");
+    printedResult = true;
     std::printf(
         "%-14s bytes_per_rank=%-8zu%s "
         "gpu_avg_device_us=%.3f gpu_avg_e2e_us=%.3f "
