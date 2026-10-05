@@ -22,7 +22,11 @@ MPI_CXX   ?= $(MPI_HOME)/bin/mpicxx
 MINT_DIR  := ..
 BUILD_DIR := $(MINT_DIR)/build
 CUDA_HOME ?= /usr/local/cuda
-CUDA_ARCH ?= 80 90 100
+# Default to the architectures of the GPUs in this machine (nvidia-smi)；
+# Fall back to a fat build when none can be queried.
+# Override with CUDA_ARCH="80 89 90" (space separated). 
+# A stamp file rebuilds the CUDA objects when the architecture list changes.
+CUDA_ARCH ?= $(or $(strip $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr -d '. \r' | sort -u | tr '\n' ' ')),80 90 100)
 
 CXX_STD   := -std=c++17
 CXXFLAGS  := $(CXX_STD) -Wall -Wextra -fPIC -O2
@@ -34,6 +38,9 @@ INCLUDES  := -I. -I$(MINT_DIR)/core -I$(MINT_DIR)/collective -I$(MINT_DIR)/third
 DEFINES   := -DUSE_IBVERBS -DMSCCLPP_USE_CUDA
 
 OUT_DIR   := build
+
+ARCH_STAMP := $(OUT_DIR)/.cuda_arch
+$(shell mkdir -p $(OUT_DIR); echo "$(CUDA_ARCH)" | cmp -s - $(ARCH_STAMP) 2>/dev/null || echo "$(CUDA_ARCH)" > $(ARCH_STAMP))
 # allgather_intranode.cu is included by nccl.cu (same anonymous namespace).
 # allgather_multinode.cu is compiled as a separate TU.
 # ReduceScatter/single-node.cu is included by ReduceScatter/multi-node.cu.
@@ -70,7 +77,7 @@ $(LIB_MINT) $(LIB_MINT_COLL): mint-deps
 $(OUT_DIR):
 	mkdir -p $@
 
-$(OUT_DIR)/%.cu.o: %.cu | $(OUT_DIR)
+$(OUT_DIR)/%.cu.o: %.cu $(ARCH_STAMP) | $(OUT_DIR)
 	mkdir -p $(@D)
 	$(NVCC) $(CUFLAGS) $(NVCC_GENCODE) $(INCLUDES) $(DEFINES) -c $< -o $@
 
@@ -86,7 +93,7 @@ $(OUT_DIR)/nccl.cu.o: $(LITE_COLL_DIR)/cpu_staging_channel.hpp $(LITE_COLL_DIR)/
 $(OUT_DIR)/$(LITE_COLL_DIR)/allgather_multinode.cu.o: lite_common.h
 $(OUT_DIR)/$(GPU_DRIVEN_DIR)/network_service.cu.o: lite_common.h $(GPU_DRIVEN_HEADERS) $(LITE_COLL_DIR)/node_exchange_buffer.hpp
 
-$(OUT_DIR)/$(LITE_COLL_DIR)/allgather_multinode.cu.o: $(LITE_COLL_DIR)/allgather_multinode.cu $(LITE_COLL_DIR)/node_exchange_buffer.hpp | $(OUT_DIR)
+$(OUT_DIR)/$(LITE_COLL_DIR)/allgather_multinode.cu.o: $(LITE_COLL_DIR)/allgather_multinode.cu $(LITE_COLL_DIR)/node_exchange_buffer.hpp $(ARCH_STAMP) | $(OUT_DIR)
 	mkdir -p $(@D)
 	$(NVCC) $(CUFLAGS) $(NVCC_GENCODE) $(INCLUDES) -I. $(DEFINES) -c $< -o $@
 
@@ -106,7 +113,7 @@ $(LIB_AUDIT_SO): $(AUDIT_OBJ)
 
 device-collectives-bench: $(OUT_DIR)/device_collectives_bench
 
-$(OUT_DIR)/device_collectives_bench.o: $(GPU_DRIVEN_DIR)/device_collectives_bench.cu $(GPU_DRIVEN_HEADERS) | $(OUT_DIR)
+$(OUT_DIR)/device_collectives_bench.o: $(GPU_DRIVEN_DIR)/device_collectives_bench.cu $(GPU_DRIVEN_HEADERS) $(ARCH_STAMP) | $(OUT_DIR)
 	$(NVCC) $(CUFLAGS) -lineinfo $(NVCC_GENCODE) -ccbin $(MPI_CXX) $(INCLUDES) $(DEFINES) -c $< -o $@
 
 $(OUT_DIR)/device_collectives_bench: $(OUT_DIR)/device_collectives_bench.o $(LIB_NCCL_SO)
