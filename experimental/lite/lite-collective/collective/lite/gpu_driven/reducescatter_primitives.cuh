@@ -163,7 +163,8 @@ static __device__ __forceinline__ int liteRsWaitFlag(
   return status;
 }
 
-// Persistent barrier epoch of the device-composed paths.
+// Epoch of the device-composed paths: advances once per collective call; the
+// chunks / steps of the call are told apart by the stamp sequence.
 static __device__ __forceinline__ unsigned long long liteRsEpochLoad(
     mscclppDeviceCollectiveHandle_t const& h) {
   __shared__ unsigned long long epoch;
@@ -173,6 +174,26 @@ static __device__ __forceinline__ unsigned long long liteRsEpochLoad(
         &h.tasks->reduceScatter.epoch));
   __syncthreads();
   return epoch;
+}
+
+static __device__ __forceinline__ unsigned long long liteRsRingEpochLoad(
+    mscclppDeviceCollectiveHandle_t const& h) {
+  __shared__ unsigned long long epoch;
+  __syncthreads();
+  if (mscclppDeviceCollectiveThreadId() == 0)
+    epoch = liteLoadAcquire(reinterpret_cast<unsigned long long*>(
+        &h.tasks->reduceScatter.ringEpoch));
+  __syncthreads();
+  return epoch;
+}
+
+static __device__ __forceinline__ void liteRsRingEpochStore(
+    mscclppDeviceCollectiveHandle_t const& h, unsigned long long epoch) {
+  if (mscclppDeviceCollectiveThreadId() == 0)
+    liteStoreRelease(reinterpret_cast<unsigned long long*>(
+                         &h.tasks->reduceScatter.ringEpoch),
+                     epoch);
+  __syncthreads();
 }
 
 static __device__ __forceinline__ void liteRsEpochStore(

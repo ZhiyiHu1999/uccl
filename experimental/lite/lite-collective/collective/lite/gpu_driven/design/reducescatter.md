@@ -37,10 +37,10 @@ Operations that need the CPU, the copy engines or the NIC are FIFO primitives ex
 | -------------------------------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------- |
 | `liteRsCopyAsync` / `liteRsAwait` (`RsCopy`) | service stream (DMA) | 1D or 2D copy between any two UVA addresses: D2D over IPC, D2H, H2D. Streams 0–3 allow parallel copies                   |
 | `liteRsHostSum` (`RsHostSum`)                  | service CPU          | float sum of up to four pinned-host rows into a host row (AVX-512 or scalar)                                              |
-| `liteRsBarrier` (`RsBarrier`)                  | service              | publish this rank's epoch in a control row of the node's host slab and wait for all local ranks                           |
+| `liteRsBarrier` (`RsBarrier`)                  | service              | publish this rank's stamp in a control row of the node's host slab and wait for all local ranks                           |
 | `liteRsSum`                                      | CTA threads          | elementwise float sum of up to four rows in peer scratch / mapped host / input; 16-byte uncached loads with 4 independent loads per thread in flight (scalar fallback for unaligned rows), system fence, CTA barrier |
 | `liteRsSignalFlag` / `liteRsWaitFlag`            | CTA thread 0         | neighbour hand-over through a control word in mapped host memory (release store / acquire wait), no FIFO round trip; used by HostRing |
-| `liteRsEpochLoad` / `liteRsEpochStore`         | CTA thread 0         | persistent barrier epoch in the FIFO control page                                                                         |
+| `liteRsEpochLoad` / `liteRsEpochStore`         | CTA thread 0         | epoch of the last collective call in the FIFO control page (advanced once per call)                                                                         |
 
 Row addresses come from `LiteRsDeviceView` (peer GPU scratch pointers, CPU and device-mapped addresses of the host slab) using the same `LiteRsLayout` offset functions as the service. The two-node paths are not decomposed yet: they submit one whole-invocation `ReduceScatter` task and the CPU schedule requests the CTA phases (like AllGather's `NetworkAllGather`).
 
@@ -146,10 +146,10 @@ are easy to get wrong. They are implemented in `reducescatter_ipc.cuh` and
   `me-1` into row 0; phase `k` (1 ≤ k ≤ P-2) writes `row[k] = shard(me-1-k) + prev.row[k-1]`;
   the final phase writes `shard(me) + prev.row[P-2]` to the output. The hand-over uses
   neighbour flags in the mapped control page, with no FIFO task: after finishing row `k` a
-  rank release-stores the chunk epoch in `flag[k][me]` and the next rank acquires it before
+  rank release-stores the chunk stamp in `flag[k][me]` and the next rank acquires it before
   reading; after the final phase it stores `flag[3][me]`, which the previous rank waits for
-  (with epoch − 1) before rewriting its rows for the next chunk. Only the neighbour is waited
-  for, like the CPU's stream flags. The ring area of the scratch stride holds three rows.
+  (against the stamp of the last ring chunk, kept in `ringEpoch`) before rewriting its rows
+  for the next chunk. Only the neighbour is waited for, like the CPU's stream flags. The ring area of the scratch stride holds three rows.
 * **Chunking and slots**: IPC/host ring chunks default to 16 MiB; local rows/bulk default to
   2 MiB. Local scratch uses one chunk slot. The CPU reference's multi-slot / IPC-event
   mechanism is replaced by independent stream completion plus an epoch barrier; no
@@ -275,15 +275,23 @@ publication, without waiting for the stream that runs the user kernel to finish.
 ## Primitive protocol, visibility and reclamation
 
 Single-node paths post a sequence of `RsCopy` / `RsHostSum` / `RsBarrier` tasks and await
-each ticket; their barrier epochs come from a persistent counter in
-`LiteReduceScatterControl` (CTA thread 0 only). Two-node paths submit one
+each ticket; their epoch is a persistent counter in `LiteReduceScatterControl` (CTA thread 0
+only) that advances once per collective call. Two-node paths submit one
 `ReduceScatter` FIFO task per call. The service publishes the source
 pointers, destination, count and source count in `LiteReduceScatterControl`, then
 releases `requested=phase`. After the CTA acquire observes the phase, the CTA copies/sums
 together; all writing threads system-fence and hit a CTA barrier, and finally one thread
 releases `completed=phase`. The final FIFO completion signals that the whole invocation
-is done. These numbers are independent: FIFO ticket, CTA phase, RS chunk epoch, and the
+is done. These numbers are independent: FIFO ticket, CTA phase, RS call epoch, and the
 existing AG/generic epochs.
+
+**Epochs and stamps.** The epoch advances by one per collective call, not per chunk. Chunks
+(or ring steps, or AllReduce ring stages) of a call are told apart by a sequence number
+starting at 1, and every control word is published and awaited as a stamp
+`(epoch << 32) | sequence`. Words are compared with `>=`, so a stamp of a later call is
+larger than every stamp of an earlier one and 0 means "never written". Pipeline slots rotate
+with `(epoch - 1 + chunk) % slots`, so back-to-back one-chunk calls do not all wait for the
+ACK of the same slot, and the per-slot credits (`previous`, `previousAck`) hold stamps.
 
 DMA progresses on nonblocking service streams, and ready is published only after a CUDA
 event confirms real completion. The NIC payload write and the ready signal use the same

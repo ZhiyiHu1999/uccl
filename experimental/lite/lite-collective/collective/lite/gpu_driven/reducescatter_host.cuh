@@ -20,10 +20,10 @@ static __device__ __forceinline__ int liteRsHostRowsBlock(
   auto* dst = reinterpret_cast<char*>(dstF);
   bool small = plan.path == LiteReduceScatterPath::HostSmall;
   bool read = plan.path == LiteReduceScatterPath::HostRead;
-  unsigned long long e = liteRsEpochLoad(h);
+  unsigned long long epoch = liteRsEpochLoad(h) + 1, seq = 0;  // one epoch per call
   for (size_t off = 0; off < B;) {
     size_t bytes = plan.chunkBytes < B - off ? plan.chunkBytes : B - off;
-    ++e;
+    unsigned long long e = liteRsStamp(epoch, ++seq);  // one stamp per chunk
     unsigned long long tickets[4] = {0, 0, 0, 0};
     if (small) {
       tickets[0] = liteRsCopyAsync(h, v.hostRow(0, me), src + off, bytes, 0,
@@ -80,7 +80,7 @@ static __device__ __forceinline__ int liteRsHostRowsBlock(
     if (rc) return rc;
     off += bytes;
   }
-  liteRsEpochStore(h, e);
+  liteRsEpochStore(h, epoch);
   return mscclppDeviceCollectiveSuccess;
 }
 
@@ -94,7 +94,8 @@ static __device__ __forceinline__ int liteRsHostRowsBlock(
 // path runs on the device without a FIFO task (like the CPU's stream flags):
 //   flag[k][me]  = chunk epoch once row k is complete (prev waits for it);
 //   flag[3][me]  = chunk epoch once this rank has read prev's rows (prev may then
-//                  rewrite them for the next chunk; waited before row 0).
+//                  rewrite them for the next chunk; waited before row 0 against the
+//                  epoch of the last ring chunk, kept in `ringEpoch`).
 static __device__ __forceinline__ int liteRsHostRingBlock(
     mscclppDeviceCollectiveHandle_t const& h, float const* srcF, float* dstF,
     size_t B, LiteReduceScatterPlan const& plan) {
@@ -103,15 +104,18 @@ static __device__ __forceinline__ int liteRsHostRingBlock(
       next = (me + 1) % n;
   auto const* src = reinterpret_cast<char const*>(srcF);
   auto* dst = reinterpret_cast<char*>(dstF);
-  unsigned long long e = liteRsEpochLoad(h);
+  unsigned long long epoch = liteRsEpochLoad(h) + 1, seq = 0;  // one epoch per call
+  // Stamp of the last chunk that used the ring rows (0: none). Other paths advance
+  // the epoch without touching the ring flags, so it is not derived from `e`.
+  unsigned long long lastRing = liteRsRingEpochLoad(h);
   for (size_t off = 0; off < B;) {
     size_t bytes = plan.chunkBytes < B - off ? plan.chunkBytes : B - off;
-    ++e;
+    unsigned long long e = liteRsStamp(epoch, ++seq);  // one stamp per chunk
     auto shard = [&](int k) {
       return src + static_cast<size_t>(((me - k) % n + n) % n) * B + off;
     };
-    // The reader of my rows (next) finished the previous chunk.
-    int rc = liteRsWaitFlag(h, v.flag(0, 3, next), e - 1);
+    // The reader of my rows (next) finished the previous ring chunk.
+    int rc = liteRsWaitFlag(h, v.flag(0, 3, next), lastRing);
     if (rc) return rc;
     char const* first[1] = {shard(1)};
     liteRsSum(v.ringRow(0, me, 0, true), first, 1, bytes);
@@ -128,9 +132,11 @@ static __device__ __forceinline__ int liteRsHostRingBlock(
     char const* last[2] = {shard(n), v.ringRow(0, prev, n - 2, true)};
     liteRsSum(dst + off, last, 2, bytes);
     liteRsSignalFlag(v.flag(0, 3, me), e);
+    lastRing = e;
     off += bytes;
   }
-  liteRsEpochStore(h, e);
+  liteRsRingEpochStore(h, lastRing);
+  liteRsEpochStore(h, epoch);
   return mscclppDeviceCollectiveSuccess;
 }
 

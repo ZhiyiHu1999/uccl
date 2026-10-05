@@ -20,10 +20,23 @@ struct LiteReduceScatterControl {
   uint64_t destination;
   size_t count;
   int sources;
-  // Single-node device-composed paths: persistent barrier epoch (CTA thread 0
-  // only; one collective per handle at a time).
+  // Single-node device-composed paths: epoch of the last collective call, advanced
+  // once per call (CTA thread 0 only; one collective per handle at a time).
   alignas(64) uint64_t epoch;
+  // HostRing: stamp of the last chunk that used the mapped ring rows. Other paths
+  // advance the epoch without touching the ring flags, so the previous ring chunk
+  // cannot be derived from the current stamp.
+  uint64_t ringEpoch;
 };
+
+// Control words are compared with >=, so every value that is published or awaited
+// is a stamp ordering (call epoch, sequence inside the call). The epoch advances
+// once per collective call; the sequence numbers the chunks / steps / stages of
+// that call from 1. Stamps of a later call are always larger than every stamp of
+// an earlier one, and 0 means "never written".
+LITE_RS_LAYOUT_HD inline uint64_t liteRsStamp(uint64_t epoch, uint64_t seq) {
+  return (epoch << 32) | (seq & 0xffffffffULL);
+}
 
 // Payload of the RS FIFO primitives. Addresses are plain UVA pointers; the
 // device derives them from LiteRsLayout so host and device never disagree.

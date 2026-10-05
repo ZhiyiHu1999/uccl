@@ -738,8 +738,8 @@ int main(int argc, char** argv) {
 
   if (rank == 0) {
     std::printf(
-        "GPU-driven vs NCCL collective latency, backend=%s, ranks=%d, "
-        "warmups=%d, iterations=%d, nccl=%s, SM budget=1, GDR=off\n",
+        "GPU-driven vs NCCL collective e2e latency, backend=%s, ranks=%d, "
+        "warmups=%d, iterations=%d, nccl=%s, SM budget=1\n",
         handle.backend == mscclppDeviceCollectiveCudaIpc
             ? "cuda_ipc"
             : (handle.backend == mscclppDeviceCollectiveHostRdma ? "host_rdma"

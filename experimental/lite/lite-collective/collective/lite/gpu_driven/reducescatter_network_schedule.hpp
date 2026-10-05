@@ -1,6 +1,7 @@
 #pragma once
 struct LiteRsChunk {
-  uint64_t epoch = 0;
+  // stamp: liteRsStamp(call epoch, chunk number); ordered across chunks and calls.
+  uint64_t stamp = 0;
   size_t offset = 0, bytes = 0;
   unsigned slot = 0;
   bool cpu = false, prefetched = false, posted = false;
@@ -26,7 +27,7 @@ static void liteRsPrepareCpuChunk(LiteReduceScatterContext& c,
   int owned = v.owned, remote = v.remote; char* send = v.send;
   liteRsStageRows(c, c.hostRow(s, c.me), src, task.bytes, w.bytes, true);
   c.drain(0, s);
-  c.barrier(s, 0, w.epoch);
+  c.barrier(s, 0, w.stamp);
   char const* inputs[4]{};
   for (int r = 0; r < c.local; ++r) inputs[r] = c.hostRow(s, r, remote);
   liteRsCpuSum(c, send, inputs, c.local, w.bytes);
@@ -95,7 +96,7 @@ static void liteRsPrepareHierarchicalChunk(LiteReduceScatterContext& c,
     }
   }
   c.drain(0, s);
-  c.barrier(s, 0, w.epoch);
+  c.barrier(s, 0, w.stamp);
   char* partnerRows = c.deviceRow(s, c.me);
   if (c.local == 4) {
     // Each pair member computes its own and cross-pair assigned ranks.
@@ -108,7 +109,7 @@ static void liteRsPrepareHierarchicalChunk(LiteReduceScatterContext& c,
             src + target * task.bytes,
             partnerRows + target * c.chunkCapacity);
     }
-    c.barrier(s, 1, w.epoch);
+    c.barrier(s, 1, w.stamp);
   }
   auto reduceNode = [&](bool remotePart) {
     unsigned resultRow = remotePart ? remoteRow : ownRow;
@@ -135,12 +136,15 @@ static void liteRsPrepareHierarchicalChunk(LiteReduceScatterContext& c,
 static LiteRsChunk liteRsPrepareNetworkChunk(LiteReduceScatterContext& c,
                                              LiteTask const& task,
                                              LiteReduceScatterPlan const& p,
-                                             size_t offset) {
+                                             size_t offset, uint64_t epoch,
+                                             size_t index) {
   LiteRsChunk w;
-  w.epoch = ++c.epoch;
+  w.stamp = liteRsStamp(epoch, index + 1);
   w.offset = offset;
   w.bytes = std::min(p.chunkBytes, task.bytes - offset);
-  w.slot = (w.epoch - 1) % c.slots;
+  // Slots rotate with the call as well as the chunk, so back-to-back one-chunk
+  // calls do not all wait for the ACK of slot 0.
+  w.slot = (epoch - 1 + index) % c.slots;
   w.cpu = p.path == LiteReduceScatterPath::SmallHost ||
           p.path == LiteReduceScatterPath::HostStaged ||
           (p.path == LiteReduceScatterPath::TwoRankSmall && !p.mappedSend);
@@ -192,7 +196,7 @@ static void liteRsPostNetworkChunk(LiteReduceScatterContext& c,
   c.event(c.postEvents[w.slot]);
   size_t off = c.offset(w.slot, c.me, c.ranks + 4);
   c.connection.write(c.remoteMemory, off, c.sendMemory, off, w.bytes);
-  c.signal(w.slot, 0, w.epoch);
+  c.signal(w.slot, 0, w.stamp);
   w.posted = true;
 }
 
@@ -207,7 +211,7 @@ static void liteRsPrefetch(LiteReduceScatterContext& c,
     c.check();
     return;
   }
-  if (ready < w.epoch) return;
+  if (ready < w.stamp) return;
   c.copy(c.deviceRow(w.slot, c.me, c.ranks + 4),
          c.hostRow(w.slot, c.me, c.ranks + 4, true), w.bytes, 1);
   MSCCLPP_CUDATHROW(cudaEventRecord(c.events[w.slot], c.streams[1]));
@@ -219,7 +223,7 @@ static void liteRsFinishNetworkChunk(LiteReduceScatterContext& c,
                                      LiteReduceScatterPlan const& p,
                                      LiteRsChunk const& w) {
   unsigned s = w.slot, remoteRow = c.ranks + 4, ownRow = c.ranks + 5;
-  c.wait(&c.ctrl(true)->value[s][0][c.me], w.epoch);
+  c.wait(&c.ctrl(true)->value[s][0][c.me], w.stamp);
   char* output = reinterpret_cast<char*>(task.destination) + w.offset;
   if (w.cpu || p.cpuFinal) {
     if (!w.cpu) {
@@ -252,9 +256,9 @@ static void liteRsFinishNetworkChunk(LiteReduceScatterContext& c,
                      : c.deviceRow(s, c.me, ownRow);
     c.gpu(output, w.bytes, own, incoming);
   }
-  c.barrier(s, 2, w.epoch);
-  c.signal(s, 1, w.epoch);
-  c.previous[s] = c.previousAck[s] = w.epoch;
+  c.barrier(s, 2, w.stamp);
+  c.signal(s, 1, w.stamp);
+  c.previous[s] = c.previousAck[s] = w.stamp;
 }
 
 // Same issue order as the CPU pipelines (runPipelinedChunks and the two-rank /
@@ -267,6 +271,7 @@ static void liteRsNetwork(LiteReduceScatterContext& c, LiteTask const& task,
   LiteRsChunk pending[5]{};
   size_t prepared = 0, posted = 0, finished = 0;
   size_t chunks = (task.bytes - 1) / p.chunkBytes + 1;
+  uint64_t epoch = ++c.epoch;  // one epoch per collective call
   auto postUpTo = [&](size_t n) {
     for (; posted < n; ++posted)
       liteRsPostNetworkChunk(c, pending[posted % c.slots]);
@@ -285,7 +290,7 @@ static void liteRsNetwork(LiteReduceScatterContext& c, LiteTask const& task,
     for (size_t j = finished; j < prepared; ++j)
       liteRsPrefetch(c, p, pending[j % c.slots]);
     pending[i % c.slots] =
-        liteRsPrepareNetworkChunk(c, task, p, i * p.chunkBytes);
+        liteRsPrepareNetworkChunk(c, task, p, i * p.chunkBytes, epoch, i);
     ++prepared;
     size_t target = prepared > p.lead ? prepared - p.lead : 0;
     if (p.eagerPost)

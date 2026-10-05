@@ -25,10 +25,10 @@ static __device__ __forceinline__ int liteRsIpcRowsBlock(
   bool parallel = plan.path == LiteReduceScatterPath::LocalRows &&
                   !plan.deviceFlags && !skipSelf &&
                   h.reduceScatterPolicy.localParallel && B >= 64 * 1024;
-  unsigned long long e = liteRsEpochLoad(h);
+  unsigned long long epoch = liteRsEpochLoad(h) + 1, seq = 0;  // one epoch per call
   for (size_t off = 0; off < B;) {
     size_t bytes = plan.chunkBytes < B - off ? plan.chunkBytes : B - off;
-    ++e;
+    unsigned long long e = liteRsStamp(epoch, ++seq);  // one stamp per chunk
     unsigned long long tickets[4] = {0, 0, 0, 0};
     for (int target = 0; target < local; ++target) {
       if (target == me && skipSelf) continue;  // read from the input instead
@@ -59,7 +59,7 @@ static __device__ __forceinline__ int liteRsIpcRowsBlock(
     if (rc) return rc;
     off += bytes;
   }
-  liteRsEpochStore(h, e);
+  liteRsEpochStore(h, epoch);
   return mscclppDeviceCollectiveSuccess;
 }
 
@@ -75,11 +75,11 @@ static __device__ __forceinline__ int liteRsPushRingBlock(
   int n = v.layout.local, me = v.layout.me, next = (me + 1) % n;
   auto const* src = reinterpret_cast<char const*>(srcF);
   auto* dst = reinterpret_cast<char*>(dstF);
-  unsigned long long e = liteRsEpochLoad(h);
+  unsigned long long epoch = liteRsEpochLoad(h) + 1, seq = 0;  // one epoch per call
   for (size_t off = 0; off < B;) {
     size_t bytes = plan.chunkBytes < B - off ? plan.chunkBytes : B - off;
     for (int step = 0; step < n - 1; ++step) {
-      ++e;
+      unsigned long long e = liteRsStamp(epoch, ++seq);  // one stamp per step
       int sendShard = (me - step - 1 + n) % n;
       int recvShard = (me - step - 2 + n) % n;
       char const* outgoing = step == 0 ? src + sendShard * B + off
@@ -100,7 +100,7 @@ static __device__ __forceinline__ int liteRsPushRingBlock(
     }
     off += bytes;
   }
-  liteRsEpochStore(h, e);
+  liteRsEpochStore(h, epoch);
   return mscclppDeviceCollectiveSuccess;
 }
 

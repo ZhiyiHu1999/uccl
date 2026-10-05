@@ -83,10 +83,10 @@ static void liteArNodeExchange(LiteReduceScatterContext& c, unsigned s,
 
 // SmallMapped: CTA stage -> local barrier -> leader exchange -> CTA copy-out.
 static void liteArSmallMapped(LiteReduceScatterContext& c,
-                              LiteTask const& task) {
+                              LiteTask const& task, uint64_t epoch) {
   size_t bytes = task.bytes;
-  uint64_t e = ++c.epoch;
-  unsigned s = (e - 1) % c.slots;
+  uint64_t e = liteRsStamp(epoch, 1);
+  unsigned s = (epoch - 1) % c.slots;
   bool leader = c.me == 0;
   liteArCredit(c, s, leader);
   auto const* src = reinterpret_cast<char const*>(task.source);
@@ -104,10 +104,10 @@ static void liteArSmallMapped(LiteReduceScatterContext& c,
 // SmallTwoLeader: D2H stage -> barrier -> part leaders (local 0 and 2) exchange
 // one half each -> H2D of both final halves.
 static void liteArSmallTwoLeader(LiteReduceScatterContext& c,
-                                 LiteTask const& task) {
+                                 LiteTask const& task, uint64_t epoch) {
   size_t bytes = task.bytes, half = bytes / 2;
-  uint64_t e = ++c.epoch;
-  unsigned s = (e - 1) % c.slots;
+  uint64_t e = liteRsStamp(epoch, 1);
+  unsigned s = (epoch - 1) % c.slots;
   bool part = c.me == 0 || c.me == 2;
   liteArCredit(c, s, part);
   auto const* src = reinterpret_cast<char const*>(task.source);
@@ -132,7 +132,8 @@ static void liteArSmallTwoLeader(LiteReduceScatterContext& c,
 // to two rows). A stage is consumed before the next one is produced, so no ACK
 // exists; epochs are drawn from the shared monotonic counter.
 static void liteArTwoRankRing(LiteReduceScatterContext& c, LiteTask const& task,
-                              LiteAllReducePlan const& p) {
+                              LiteAllReducePlan const& p, uint64_t epoch) {
+  uint64_t seq = 0;  // numbers the stages of this call
   auto const* src = reinterpret_cast<char const*>(task.source);
   auto* dst = reinterpret_cast<char*>(task.destination);
   size_t count = task.bytes / sizeof(float);
@@ -178,7 +179,7 @@ static void liteArTwoRankRing(LiteReduceScatterContext& c, LiteTask const& task,
       if (part[k].active && part[k].peerBytes) c.drain(k, k);
     for (int k = 0; k < 2; ++k) {
       if (!part[k].active) continue;
-      part[k].sendEpoch = ++c.epoch;
+      part[k].sendEpoch = liteRsStamp(epoch, ++seq);
       write(k, c.offset(k, c.me, 0), part[k].peerBytes);
       c.signal(k, 0, part[k].sendEpoch, k);
     }
@@ -198,7 +199,7 @@ static void liteArTwoRankRing(LiteReduceScatterContext& c, LiteTask const& task,
     }
     for (int k = 0; k < 2; ++k) {
       if (!part[k].active) continue;
-      part[k].finalEpoch = ++c.epoch;
+      part[k].finalEpoch = liteRsStamp(epoch, ++seq);
       write(k, c.offset(k, c.me, 2), part[k].ownBytes);
       c.signal(k, 1, part[k].finalEpoch, k);
     }
@@ -223,15 +224,16 @@ static void executeLiteAllReduce(LiteReduceScatterContext& c,
     throw mscclpp::Error("invalid AllReduce descriptor",
                          mscclpp::ErrorCode::InvalidUsage);
   try {
+    uint64_t epoch = ++c.epoch;  // one epoch per collective call
     switch (p.path) {
       case LiteAllReducePath::SmallMapped:
-        liteArSmallMapped(c, task);
+        liteArSmallMapped(c, task, epoch);
         break;
       case LiteAllReducePath::SmallTwoLeader:
-        liteArSmallTwoLeader(c, task);
+        liteArSmallTwoLeader(c, task, epoch);
         break;
       case LiteAllReducePath::TwoRankRing:
-        liteArTwoRankRing(c, task, p);
+        liteArTwoRankRing(c, task, p, epoch);
         break;
       default:
         throw mscclpp::Error("unsupported AllReduce path",

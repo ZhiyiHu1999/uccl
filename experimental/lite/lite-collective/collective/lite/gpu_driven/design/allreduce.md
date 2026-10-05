@@ -112,8 +112,10 @@ the remote partial arrives at the same offset of the receive slab), row 2 = fina
   ACK lets the remote reuse our receive row, so before a slot is rewritten a leader waits for
   the previous remote ACK (`previousAck`) and every rank for the previous local done barrier
   (`previous`). Ranks that do not exchange (non-leaders) never wait for or send ACKs.
-* **Epochs** come from the ReduceScatter context's monotonic counter, so ring, RS and AllReduce
-  words never regress each other. Slots rotate with the epoch.
+* **Epochs** come from the ReduceScatter context's counter, which advances once per collective
+  call (RS or AllReduce), so ring, RS and AllReduce words never regress each other. Inside a
+  call, the stages of the ring are numbered by a sequence and every control word carries the
+  stamp `(epoch << 32) | sequence`; small paths use sequence 1. Slots rotate with the epoch.
 * **TwoRankRing** uses slot `k` and connection `k` for channel `k`, control rows 0 (peer part
   arrived) and 1 (final part arrived). Stage 0 sits at row 0 and stage 1 at row 2 (each up to
   two rows); a stage is consumed before the next one is produced, so no ACK is needed. One
