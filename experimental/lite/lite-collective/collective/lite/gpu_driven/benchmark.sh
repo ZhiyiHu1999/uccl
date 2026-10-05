@@ -154,16 +154,25 @@ trap 'rm -f "${RAW_OUTPUT}"' EXIT
 } >"${RESULT_FILE}"
 
 awk -v selected="${SELECTED_COLLECTIVE}" '
-  /^(allgather|allreduce|reducescatter)[[:space:]]/ && /gpu_avg_device_us=/ {
-    collective = $1
-    row = ++count[collective]
-    for (i = 2; i <= NF; ++i) {
-      split($i, field, "=")
-      key = field[1]
-      parsed = field[2]
-      # Accept both key=value and the older padded key=  value format.
-      if (parsed == "" && i < NF) parsed = $(++i)
-      value[collective, row, key] = parsed
+  # A result group starts with "<collective> bytes_per_rank=N" and spans the
+  # following key=value lines up to the one carrying avg_speedup_e2e. Other lines
+  # that merely start with a collective name (selected_backend, path notices) never
+  # reach the speedup line, so they are dropped when the next group header resets.
+  /^(allgather|allreduce|reducescatter)[[:space:]]+bytes_per_rank=/ {
+    current = $1
+    delete pending
+    collecting = 1
+  }
+  collecting {
+    for (i = 1; i <= NF; ++i) {
+      position = index($i, "=")
+      if (!position) continue
+      pending[substr($i, 1, position - 1)] = substr($i, position + 1)
+    }
+    if ($0 ~ /avg_speedup_e2e=/) {
+      row = ++count[current]
+      for (key in pending) value[current, row, key] = pending[key]
+      collecting = 0
     }
   }
   END {

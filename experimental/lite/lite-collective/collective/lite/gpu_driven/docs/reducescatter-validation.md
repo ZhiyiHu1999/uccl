@@ -86,8 +86,14 @@ The script forwards exported `MSCCLPP_NCCL_RS_*` policy variables to MPI ranks;
 all ranks must agree. Every ReduceScatter result line carries the path it measured:
 
 ```text
-reducescatter  bytes_per_rank=1048576  path=HostRing chunk_bytes=1048576 slots=1 lead=0 opts=- gpu_avg_device_us=... avg_speedup_e2e=...x
+reducescatter  bytes_per_rank=1048576
+path=HostRing chunk_bytes=1048576 slots=1 lead=0 opts=-
+gpu_avg_device_us=292.769 gpu_avg_e2e_us=300.384
+nccl_avg_device_us=261.087 nccl_avg_e2e_us=273.392
+avg_speedup_e2e=0.910x
 ```
+
+Each message size is one group of lines, separated from the next group by a blank line.
 
 `opts` lists the enabled plan options joined by `+` (`device_flags`, `direct_partner`,
 `partner_2d`, `mapped_send`, `host_final`, `split_final`, `async_final`, `record_async`,

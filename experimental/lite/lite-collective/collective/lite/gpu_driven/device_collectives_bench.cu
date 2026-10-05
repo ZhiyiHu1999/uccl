@@ -441,13 +441,13 @@ static void runComparison(BenchCollective collective, size_t bytes, int warmups,
     add(plan.eagerPost, "eager_post");
     char buffer[256];
     std::snprintf(buffer, sizeof(buffer),
-                  " path=%s chunk_bytes=%zu slots=%u lead=%u opts=%s",
+                  "path=%s chunk_bytes=%zu slots=%u lead=%u opts=%s",
                   liteReduceScatterPathName(plan.path), plan.chunkBytes,
                   plan.slots, plan.lead, opts.empty() ? "-" : opts.c_str());
     pathInfo = buffer;
     if (char const* verbose = std::getenv("UCCL_GPU_DRIVEN_BENCH_VERBOSE"))
       if (verbose[0] && verbose[0] != '0')
-        std::fprintf(stderr, "reducescatter bytes_per_rank=%zu%s (starting)\n",
+        std::fprintf(stderr, "reducescatter bytes_per_rank=%zu %s (starting)\n",
                      bytes, pathInfo.c_str());
   }
   if (ipcOutput)
@@ -612,14 +612,20 @@ static void runComparison(BenchCollective collective, size_t bytes, int warmups,
     static bool printedResult = false;
     if (printedResult) std::printf("\n");
     printedResult = true;
-    std::printf(
-        "%-14s bytes_per_rank=%-8zu%s "
-        "gpu_avg_device_us=%.3f gpu_avg_e2e_us=%.3f "
-        "nccl_avg_device_us=%.3f nccl_avg_e2e_us=%.3f "
-        "avg_speedup_e2e=%.3fx\n",
-        collectiveName(collective), bytes, pathInfo.c_str(),
-        mean(gpuDeviceTimes), gpuE2e, mean(ncclDeviceTimes), ncclE2e,
-        ncclE2e / gpuE2e);
+    // One group per message size, one line per kind of information:
+    //   <collective> bytes_per_rank=N
+    //   path=... chunk_bytes=... slots=... lead=... opts=...   (ReduceScatter)
+    //   gpu_avg_device_us=... gpu_avg_e2e_us=...
+    //   nccl_avg_device_us=... nccl_avg_e2e_us=...
+    //   avg_speedup_e2e=...x
+    std::printf("%-14s bytes_per_rank=%zu\n", collectiveName(collective),
+                bytes);
+    if (!pathInfo.empty()) std::printf("%s\n", pathInfo.c_str());
+    std::printf("gpu_avg_device_us=%.3f gpu_avg_e2e_us=%.3f\n",
+                mean(gpuDeviceTimes), gpuE2e);
+    std::printf("nccl_avg_device_us=%.3f nccl_avg_e2e_us=%.3f\n",
+                mean(ncclDeviceTimes), ncclE2e);
+    std::printf("avg_speedup_e2e=%.3fx\n", ncclE2e / gpuE2e);
     std::fflush(stdout);
   }
 
