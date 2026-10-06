@@ -72,13 +72,12 @@ static void liteArNodeExchange(LiteReduceScatterContext& c, unsigned s,
   char* partial = c.hostRow(s, c.me, 1);
   liteRsCpuSum(c, partial, rows, c.local, bytes);
   size_t off = c.offset(s, c.me, 1);
-  c.connection.write(c.remoteMemory, off, c.sendMemory, off, bytes);
-  c.signal(s, 0, e);
+  c.postDataAndSignal(s, 0, e, off, bytes);
   c.wait(&c.ctrl(true)->value[s][0][c.me], e);
   char const* pair[2] = {partial, c.hostRow(s, c.me, 1, true)};
   liteRsCpuSum(c, c.hostRow(s, c.me, 2), pair, 2, bytes);
   __atomic_store_n(&c.ctrl()->value[s][3][c.me], e, __ATOMIC_RELEASE);
-  c.signal(s, 1, e);
+  c.postSignal(s, 1, e);
 }
 
 // SmallMapped: CTA stage -> local barrier -> leader exchange -> CTA copy-out.
@@ -150,10 +149,6 @@ static void liteArTwoRankRing(LiteReduceScatterContext& c, LiteTask const& task,
     size_t ownOff = 0, ownBytes = 0, peerOff = 0, peerBytes = 0;
     uint64_t sendEpoch = 0, finalEpoch = 0;
   };
-  auto write = [&](int k, size_t off, size_t bytes) {
-    auto& conn = k ? c.connection2 : c.connection;
-    if (bytes) conn.write(c.remoteMemory, off, c.sendMemory, off, bytes);
-  };
   for (size_t loop = 0; loop < loops; ++loop) {
     Part part[2];
     for (int k = 0; k < 2; ++k) {
@@ -180,8 +175,8 @@ static void liteArTwoRankRing(LiteReduceScatterContext& c, LiteTask const& task,
     for (int k = 0; k < 2; ++k) {
       if (!part[k].active) continue;
       part[k].sendEpoch = liteRsStamp(epoch, ++seq);
-      write(k, c.offset(k, c.me, 0), part[k].peerBytes);
-      c.signal(k, 0, part[k].sendEpoch, k);
+      c.postDataAndSignal(k, 0, part[k].sendEpoch, c.offset(k, c.me, 0),
+                          part[k].peerBytes, k);
     }
     // Own part: remote contribution H2D, CTA add into the output, D2H of the
     // reduced part, then post it.
@@ -200,8 +195,8 @@ static void liteArTwoRankRing(LiteReduceScatterContext& c, LiteTask const& task,
     for (int k = 0; k < 2; ++k) {
       if (!part[k].active) continue;
       part[k].finalEpoch = liteRsStamp(epoch, ++seq);
-      write(k, c.offset(k, c.me, 2), part[k].ownBytes);
-      c.signal(k, 1, part[k].finalEpoch, k);
+      c.postDataAndSignal(k, 1, part[k].finalEpoch, c.offset(k, c.me, 2),
+                          part[k].ownBytes, k);
     }
     // Remote final part H2D into the output.
     for (int k = 0; k < 2; ++k) {

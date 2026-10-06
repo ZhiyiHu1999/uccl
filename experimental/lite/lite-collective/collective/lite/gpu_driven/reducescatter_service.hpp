@@ -32,7 +32,20 @@ struct LiteReduceScatterContext {
   mscclpp::Connection connection;
   // Second independent channel of the two-rank AllReduce ring (2n*1g only).
   mscclpp::Connection connection2;
-  mscclpp::RegisteredMemory sendMemory, recvMemory, remoteMemory;
+  // Raw QP posting of the two channels, as the CPU reference does
+  // (postPairDataAndSignal / postSmallSignal): the payload and its ready word go
+  // out in one doorbell and only every kWireSignalEvery-th post is signaled, so a
+  // post never waits for the NIC. Reuse of the send row and of the signal source
+  // words is protected by the remote ACK (slot credit), not by flushing.
+  struct Wire {
+    std::shared_ptr<mscclpp::IbQp> qp;
+    mscclpp::IbMr const* mr = nullptr;
+    mscclpp::IbMrInfo remote{};
+    uint64_t writes = 0;
+  };
+  Wire wire[2];
+  mscclpp::Transport ibTransport = mscclpp::Transport::Unknown;
+  static constexpr uint64_t kWireSignalEvery = 128;  mscclpp::RegisteredMemory sendMemory, recvMemory, remoteMemory;
   LiteTaskFifo* fifo = nullptr;
   std::atomic<bool>* stop = nullptr;
 
@@ -41,6 +54,7 @@ struct LiteReduceScatterContext {
       if (s) cudaStreamSynchronize(s);
     connection = {};
     connection2 = {};
+    for (auto& w : wire) w = Wire{};
     remoteMemory = {};
     recvMemory = {};
     sendMemory = {};
@@ -144,6 +158,57 @@ struct LiteReduceScatterContext {
   }
   // Signalling memory is stable until flush. Payload and ready are ordered on
   // the same CPU-memory QP. ACK is sent only after H2D/CTA consumption.
+  void wireOpen(int channel, mscclpp::Connection& conn) {
+    auto& w = wire[channel];
+    w.qp = conn.getIbQp();
+    if (!w.qp) return;
+    sendMemory.getIbMrInfo(ibTransport, &w.mr, nullptr);
+    remoteMemory.getIbMrInfo(ibTransport, nullptr, &w.remote);
+    if (!w.mr) w.qp.reset();
+  }
+  void wireDrain(Wire& w) {
+    while (w.qp->getNumSendCqItems() > 0) {
+      int completed = w.qp->pollSendCq();
+      if (completed < 0)
+        throw mscclpp::Error("ReduceScatter pollSendCq failed",
+                             mscclpp::ErrorCode::SystemError);
+      for (int i = 0; i < completed; ++i)
+        if (w.qp->getSendWcStatus(i) != 0)
+          throw mscclpp::Error("ReduceScatter RDMA write failed: " +
+                                   w.qp->getSendWcStatusString(i),
+                               mscclpp::ErrorCode::SystemError);
+      check();
+    }
+  }
+  // Writes `bytes` at `dataOffset` of the remote receive slab (same offset as the
+  // local send row) and then publishes control word (slot, kind) = stamp.
+  void postDataAndSignal(unsigned slot, unsigned kind, uint64_t stamp,
+                         size_t dataOffset, size_t bytes, int channel = 0) {
+    auto& w = wire[channel];
+    if (!w.qp) {  // not an IB queue pair: synchronous fallback
+      auto& conn = channel ? connection2 : connection;
+      if (bytes) conn.write(remoteMemory, dataOffset, sendMemory, dataOffset, bytes);
+      signal(slot, kind, stamp, channel);
+      return;
+    }
+    auto* word = &ctrl()->value[slot][kind + 6][me];
+    *word = stamp;
+    size_t src = reinterpret_cast<char*>(word) - host->sendPtr();
+    size_t dst = reinterpret_cast<char*>(&ctrl(true)->value[slot][kind][me]) -
+                 host->recvPtr();
+    bool signaled = (++w.writes % kWireSignalEvery) == 0;
+    if (bytes)
+      w.qp->stageSendWrite(w.mr, w.remote, static_cast<uint32_t>(bytes), 0,
+                           dataOffset, dataOffset, false);
+    w.qp->stageSendWrite(w.mr, w.remote, sizeof(uint64_t), 0, src, dst,
+                         signaled);
+    w.qp->postSend();
+    if (signaled) wireDrain(w);
+  }
+  void postSignal(unsigned slot, unsigned kind, uint64_t stamp,
+                  int channel = 0) {
+    postDataAndSignal(slot, kind, stamp, 0, 0, channel);
+  }
   void signal(unsigned slot, unsigned kind, uint64_t e, int channel = 0) {
     unsigned sourceKind = kind + 6;
     auto* word = &ctrl()->value[slot][sourceKind][me];
@@ -413,7 +478,10 @@ static void prepareLiteReduceScatter(LiteReduceScatterContext& c,
     comm->comm->sendMemory(c.recvMemory, peer, tag + 1);
     auto memory = comm->comm->recvMemory(peer, tag + 1);
     c.connection = connection.get();
+    c.ibTransport = transport;
     if (c.local == 1) c.connection2 = second.get();
+    c.wireOpen(0, c.connection);
+    if (c.local == 1) c.wireOpen(1, c.connection2);
     c.remoteMemory = memory.get();
   }
 }

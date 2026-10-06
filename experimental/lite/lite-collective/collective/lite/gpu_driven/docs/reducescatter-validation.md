@@ -68,6 +68,16 @@ above 16 MiB,
 and that AllGather / AllReduce on an uncapped handle are unchanged (the field equals the
 capacity when unset).
 
+## 2n×1g TwoRankPipeline throughput (2026-10-06)
+
+Measured before this change: TwoRankPipeline reached 0.18x–0.27x of NCCL (1 GiB: 561 ms vs 100 ms).
+Compared with the CPU loop (`runTwoRankPipelinedChunks`) the GPU-driven schedule blocked the service
+thread on `flush()` after every payload and ACK, and posted RDMA only when finishing a chunk. RDMA
+now uses raw QP posting with selective signaling (see design/reducescatter.md) and 2n×1g pipelines
+post eagerly. Untested; re-measure 1 MiB..1 GiB. If it is still below NCCL, the next step is
+issuing the CTA add of a chunk asynchronously (a request ring for the phase protocol) so that the
+H2D wait and the CTA phase leave the service thread's critical path.
+
 ## Target-machine benchmark matrix
 
 Use the existing benchmark; it performs untimed correctness preflight before

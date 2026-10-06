@@ -195,8 +195,7 @@ static void liteRsPostNetworkChunk(LiteReduceScatterContext& c,
   if (w.posted) return;
   c.event(c.postEvents[w.slot]);
   size_t off = c.offset(w.slot, c.me, c.ranks + 4);
-  c.connection.write(c.remoteMemory, off, c.sendMemory, off, w.bytes);
-  c.signal(w.slot, 0, w.stamp);
+  c.postDataAndSignal(w.slot, 0, w.stamp, off, w.bytes);
   w.posted = true;
 }
 
@@ -257,7 +256,7 @@ static void liteRsFinishNetworkChunk(LiteReduceScatterContext& c,
     c.gpu(output, w.bytes, own, incoming);
   }
   c.barrier(s, 2, w.stamp);
-  c.signal(s, 1, w.stamp);
+  c.postSignal(s, 1, w.stamp);
   c.previous[s] = c.previousAck[s] = w.stamp;
 }
 

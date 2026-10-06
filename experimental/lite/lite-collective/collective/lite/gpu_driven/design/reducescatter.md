@@ -182,6 +182,18 @@ rank has its own connection to the same-local-rank peer on the other node.
   local partial and do the final add on the CPU. Defaults are in the pipeline policy
   table below.
 
+## RDMA posting
+
+All two-node RDMA goes through the queue pair of each connection directly, like the CPU
+reference (`postPairDataAndSignal`, `postSmallSignal`): a chunk's payload and its ready word are
+staged and posted in one doorbell, the ready write is signaled only every 128th post (the CQ is
+then drained), and ACK words are posted the same way. A post never waits for the NIC.
+Reusing a send row or a signal source word is protected by the remote ACK of the slot (the
+slot credit), not by flushing. The earlier implementation used `Connection::write` followed by
+`flush()` after every payload and every ACK, which blocked the service thread until the NIC
+completed (about 90 µs per MiB, plus a wait for all outstanding writes at every ACK). The
+fallback for non-IB transports still writes and flushes.
+
 ## Capacity and the two-node payload slab
 
 `maxBytesPerRank` of a ReduceScatter handle is the complete input (`R × B`), R times the row
@@ -249,6 +261,10 @@ corresponding environment variable is set:
 | Eager RDMA post                        | pipelined and T_bytes ≥ 4 MiB               | pipelined and T_bytes ≥ 8 MiB                                                |
 | Direct partner copy                    | always (2D rows)                             | T_bytes ≥ 1 MiB                                                              |
 | CPU final add                          | sync single chunk only,`CPU_FINAL_ADD`     | same                                                                          |
+
+Two-rank (2n×1g) pipelines also post eagerly (any call with more than one chunk): the CPU loop
+never blocks on its RDMA post and consumes chunks asynchronously, so the NIC keeps working while
+earlier chunks are consumed.
 
 Two-rank leads use the 1 / 3 / 3 classes (`SHORT`/`LOCAL`/`LONG_LOCAL_LEAD_CHUNKS`);
 an explicit class variable overrides every layout, `0` meaning no lead. SmallHost and

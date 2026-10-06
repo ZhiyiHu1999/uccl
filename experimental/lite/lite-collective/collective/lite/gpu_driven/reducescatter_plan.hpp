@@ -96,7 +96,7 @@ struct LiteReduceScatterPlan {
   //   add on the CPU (CPU_FINAL_ADD).
   bool eagerPost = false;
   // eagerPost: Post a chunk's RDMA `lead` chunks behind preparation instead of
-  //   right before completing it; only for pipelined 2n*2g / 2n*4g.
+  //   right before completing it; for pipelined 2n*1g, 2n*2g and 2n*4g.
 };
 LITE_RS_HD inline size_t liteRsLead(size_t configured, size_t fallback) {
   return configured == ~size_t{0} ? fallback : configured;
@@ -188,6 +188,11 @@ LITE_RS_HD inline LiteReduceScatterPlan litePlanReduceScatter(
       } else {
         // CPU runTwoRankPipelinedChunks is always D2H / H2D DMA + add.
         p.asyncFinal = chunks > 1;
+        // The CPU loop never blocks on its RDMA post and consumes chunks
+        // asynchronously, so the NIC keeps working while earlier chunks are
+        // consumed; posting `lead` chunks behind preparation gives the same
+        // overlap here.
+        p.eagerPost = chunks > 1;
         p.lead = static_cast<unsigned>(
             liteRsMin(liteRsLead(leadClass, leadDefault), p.slots - 1));
       }
