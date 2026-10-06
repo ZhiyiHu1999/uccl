@@ -45,10 +45,12 @@ struct LiteReduceScatterContext {
   };
   Wire wire[2];
   mscclpp::Transport ibTransport = mscclpp::Transport::Unknown;
-  // UCCL_GPU_DRIVEN_RS_TRACE=1: accumulate the time the two-node schedule spends in
-  // each stage and print the per-call averages every 50 calls from rank 0.
+  static constexpr uint64_t kWireSignalEvery = 128;
+  // TEMPORARY diagnostics (UCCL_GPU_DRIVEN_RS_TRACE=1): per-call average time of
+  // each stage of the two-node schedule, printed by rank 0 every 50 calls.
   struct Trace {
-    enum Stage { Credit, Prepare, Post, WaitRemote, H2d, Cta, Ack, Total, kStages };
+    enum Stage { Credit, Pair, PairBarrier, AddRemote, AddLocal, D2hIssue, Post,
+                 WaitRemote, H2d, Cta, Ack, Total, kStages };
     bool on = false;
     uint64_t calls = 0;
     double us[kStages] = {};
@@ -65,7 +67,8 @@ struct LiteReduceScatterContext {
         t.us[stage] += std::chrono::duration<double, std::micro>(
                            std::chrono::steady_clock::now() - begin).count();
     }
-  };  static constexpr uint64_t kWireSignalEvery = 128;  mscclpp::RegisteredMemory sendMemory, recvMemory, remoteMemory;
+  };
+  mscclpp::RegisteredMemory sendMemory, recvMemory, remoteMemory;
   LiteTaskFifo* fifo = nullptr;
   std::atomic<bool>* stop = nullptr;
 

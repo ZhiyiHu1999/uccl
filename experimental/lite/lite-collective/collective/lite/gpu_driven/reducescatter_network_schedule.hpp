@@ -71,6 +71,8 @@ static void liteRsPrepareHierarchicalChunk(LiteReduceScatterContext& c,
   // never share an index.
   int parity = partner & 1;
   char* stage = c.deviceRow(s, p.directPartner ? partner : c.me);
+  {
+  LiteReduceScatterContext::Timed timedPair(c.trace, LiteReduceScatterContext::Trace::Pair);
   if (p.partner2d) {
     MSCCLPP_CUDATHROW(cudaMemcpy2DAsync(
         stage + parity * c.chunkCapacity, 2 * c.chunkCapacity,
@@ -96,7 +98,9 @@ static void liteRsPrepareHierarchicalChunk(LiteReduceScatterContext& c,
     }
   }
   c.drain(0, s);
-  c.barrier(s, 0, w.stamp);
+  }
+  { LiteReduceScatterContext::Timed t(c.trace, LiteReduceScatterContext::Trace::PairBarrier);
+    c.barrier(s, 0, w.stamp); }
   char* partnerRows = c.deviceRow(s, c.me);
   if (c.local == 4) {
     // Each pair member computes its own and cross-pair assigned ranks.
@@ -112,6 +116,8 @@ static void liteRsPrepareHierarchicalChunk(LiteReduceScatterContext& c,
     c.barrier(s, 1, w.stamp);
   }
   auto reduceNode = [&](bool remotePart) {
+    LiteReduceScatterContext::Timed timedAdd(
+        c.trace, remotePart ? LiteReduceScatterContext::Trace::AddRemote : LiteReduceScatterContext::Trace::AddLocal);
     unsigned resultRow = remotePart ? remoteRow : ownRow;
     char* result = remotePart && p.mappedSend
                        ? c.mappedRow(s, c.me, resultRow)
@@ -128,7 +134,10 @@ static void liteRsPrepareHierarchicalChunk(LiteReduceScatterContext& c,
   };
   if (!p.splitFinal) reduceNode(false);
   reduceNode(true);
-  if (!p.mappedSend) c.copy(send, c.deviceRow(s, c.me, remoteRow), w.bytes);
+  if (!p.mappedSend) {
+    LiteReduceScatterContext::Timed t(c.trace, LiteReduceScatterContext::Trace::D2hIssue);
+    c.copy(send, c.deviceRow(s, c.me, remoteRow), w.bytes);
+  }
   // Remote D2H progresses while this same CTA computes the local partial.
   if (p.splitFinal) reduceNode(false);
 }
@@ -152,8 +161,7 @@ static LiteRsChunk liteRsPrepareNetworkChunk(LiteReduceScatterContext& c,
   // Local consumers retired before this slot was released; remote ACK is
   // independent of send completion, and persists across message regimes.
   {
-    LiteReduceScatterContext::Timed timed(c.trace,
-                                          LiteReduceScatterContext::Trace::Credit);
+    LiteReduceScatterContext::Timed timed(c.trace, LiteReduceScatterContext::Trace::Credit);
     if (c.previousAck[s])
       c.wait(&c.ctrl(true)->value[s][1][c.me], c.previousAck[s]);
     if (c.previous[s])
@@ -197,8 +205,7 @@ static LiteRsChunk liteRsPrepareNetworkChunk(LiteReduceScatterContext& c,
 static void liteRsPostNetworkChunk(LiteReduceScatterContext& c,
                                    LiteRsChunk& w) {
   if (w.posted) return;
-  LiteReduceScatterContext::Timed timed(c.trace,
-                                        LiteReduceScatterContext::Trace::Post);
+  LiteReduceScatterContext::Timed timed(c.trace, LiteReduceScatterContext::Trace::Post);
   c.event(c.postEvents[w.slot]);
   size_t off = c.offset(w.slot, c.me, c.ranks + 4);
   c.postDataAndSignal(w.slot, 0, w.stamp, off, w.bytes);
@@ -303,12 +310,8 @@ static void liteRsNetwork(LiteReduceScatterContext& c, LiteTask const& task,
     if (i >= c.slots) finishUpTo(i - c.slots + 1);
     for (size_t j = finished; j < prepared; ++j)
       liteRsPrefetch(c, p, pending[j % c.slots]);
-    {
-      LiteReduceScatterContext::Timed timed(
-          c.trace, LiteReduceScatterContext::Trace::Prepare);
-      pending[i % c.slots] =
-          liteRsPrepareNetworkChunk(c, task, p, i * p.chunkBytes, epoch, i);
-    }
+    pending[i % c.slots] =
+        liteRsPrepareNetworkChunk(c, task, p, i * p.chunkBytes, epoch, i);
     ++prepared;
     size_t target = prepared > p.lead ? prepared - p.lead : 0;
     if (p.eagerPost)
@@ -319,20 +322,20 @@ static void liteRsNetwork(LiteReduceScatterContext& c, LiteTask const& task,
   postUpTo(chunks);
   finishUpTo(chunks);
   if (c.trace.on) {
-    c.trace.us[LiteReduceScatterContext::Trace::Total] +=
+    auto& t = c.trace;
+    t.us[LiteReduceScatterContext::Trace::Total] +=
         std::chrono::duration<double, std::micro>(
             std::chrono::steady_clock::now() - totalBegin).count();
-    ++c.trace.calls;
-    if (c.trace.calls % 50 == 0 && c.rank == 0) {
-      auto& t = c.trace;
+    if (++t.calls % 50 == 0 && c.rank == 0) {
       double n = static_cast<double>(t.calls);
       std::fprintf(stderr,
-                   "[rs-trace] calls=%llu chunks=%zu avg_us/call: total=%.1f "
-                   "credit=%.1f prepare=%.1f post=%.1f wait_remote=%.1f h2d=%.1f "
-                   "cta=%.1f ack=%.1f\n",
-                   static_cast<unsigned long long>(t.calls), chunks,
-                   t.us[7] / n, t.us[0] / n, t.us[1] / n, t.us[2] / n,
-                   t.us[3] / n, t.us[4] / n, t.us[5] / n, t.us[6] / n);
+                   "[rs-trace] chunks=%zu avg_us/call: total=%.0f credit=%.0f "
+                   "pair_copy=%.0f pair_barrier=%.0f add_remote=%.0f "
+                   "add_local=%.0f d2h_issue=%.0f post=%.0f wait_remote=%.0f "
+                   "h2d=%.0f cta=%.0f ack=%.0f\n",
+                   chunks, t.us[11] / n, t.us[0] / n, t.us[1] / n, t.us[2] / n,
+                   t.us[3] / n, t.us[4] / n, t.us[5] / n, t.us[6] / n,
+                   t.us[7] / n, t.us[8] / n, t.us[9] / n, t.us[10] / n);
       t.calls = 0;
       for (auto& v : t.us) v = 0;
     }
