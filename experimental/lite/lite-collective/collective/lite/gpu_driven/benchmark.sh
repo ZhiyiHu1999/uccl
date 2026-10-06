@@ -190,35 +190,38 @@ awk -v selected="${SELECTED_COLLECTIVE}" '
       collective = order[section]
       if (selected != "all" && selected != collective) continue
       printf "\n## %s\n\n", title[collective]
-      # Rows that report the selected path (ReduceScatter) get a Path column.
+      # Rows that report the selected path (ReduceScatter) get Path and Options
+      # columns; rows that report the selected backend (AllGather) a Backend column.
       hasPath = 0
-      for (row = 1; row <= count[collective]; ++row)
-        if (value[collective, row, "path"] != "") hasPath = 1
-      if (hasPath) {
-        print "| Bytes per rank | Path | Options | GPU avg device (us) | GPU avg E2E (us) | NCCL avg device (us) | NCCL avg E2E (us) | Avg E2E speedup |"
-        print "|---:|---|---|---:|---:|---:|---:|---:|"
-      } else {
-        print "| Bytes per rank | GPU avg device (us) | GPU avg E2E (us) | NCCL avg device (us) | NCCL avg E2E (us) | Avg E2E speedup |"
-        print "|---:|---:|---:|---:|---:|---:|"
-      }
+      hasBackend = 0
       for (row = 1; row <= count[collective]; ++row) {
-        speedup = value[collective, row, "avg_speedup_e2e"]
+        if (value[collective, row, "path"] != "") hasPath = 1
+        if (value[collective, row, "selected_backend"] != "") hasBackend = 1
+      }
+      header = "| Bytes per rank |"
+      divider = "|---:|"
+      if (hasPath) {
+        header = header " Path | Options |"
+        divider = divider "---|---|"
+      }
+      if (hasBackend) {
+        header = header " Backend |"
+        divider = divider "---|"
+      }
+      print header " GPU avg device (us) | GPU avg E2E (us) | NCCL avg device (us) | NCCL avg E2E (us) | Avg E2E speedup |"
+      print divider "---:|---:|---:|---:|---:|"
+      for (row = 1; row <= count[collective]; ++row) {
+        line = "| " value[collective, row, "bytes_per_rank"] " |"
         if (hasPath)
-          printf "| %s | %s | %s | %s | %s | %s | %s | %s |\n", \
-            value[collective, row, "bytes_per_rank"], \
-            value[collective, row, "path"], \
-            value[collective, row, "opts"], \
-            value[collective, row, "gpu_avg_device_us"], \
-            value[collective, row, "gpu_avg_e2e_us"], \
-            value[collective, row, "nccl_avg_device_us"], \
-            value[collective, row, "nccl_avg_e2e_us"], speedup
-        else
-          printf "| %s | %s | %s | %s | %s | %s |\n", \
-            value[collective, row, "bytes_per_rank"], \
-            value[collective, row, "gpu_avg_device_us"], \
-            value[collective, row, "gpu_avg_e2e_us"], \
-            value[collective, row, "nccl_avg_device_us"], \
-            value[collective, row, "nccl_avg_e2e_us"], speedup
+          line = line " " value[collective, row, "path"] " | " value[collective, row, "opts"] " |"
+        if (hasBackend)
+          line = line " " value[collective, row, "selected_backend"] " |"
+        printf "%s %s | %s | %s | %s | %s |\n", line, \
+          value[collective, row, "gpu_avg_device_us"], \
+          value[collective, row, "gpu_avg_e2e_us"], \
+          value[collective, row, "nccl_avg_device_us"], \
+          value[collective, row, "nccl_avg_e2e_us"], \
+          value[collective, row, "avg_speedup_e2e"]
       }
     }
   }

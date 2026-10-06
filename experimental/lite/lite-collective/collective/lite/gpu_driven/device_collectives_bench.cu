@@ -403,11 +403,23 @@ static void runComparison(BenchCollective collective, size_t bytes, int warmups,
                     handle.ranksPerNode, true, true, handle.maxBytesPerRank,
                     bytes / nranks, 0).path == LiteDeviceAllGatherPath::IpcRing;
   }
-  if (!rank && collective == BenchCollective::AllGather)
-    std::printf("allgather bytes_per_rank=%zu selected_backend=%s\n", bytes,
-                ipcOutput ? "cuda_ipc" :
-                handle.backend == mscclppDeviceCollectiveHostRdma
-                    ? "host_rdma" : "host");
+  // Selected configuration, reported inside the result group (like ReduceScatter's
+  // path line). UCCL_GPU_DRIVEN_BENCH_VERBOSE=1 also prints it before the run.
+  std::string pathInfo;
+  auto verbose = [] {
+    char const* value = std::getenv("UCCL_GPU_DRIVEN_BENCH_VERBOSE");
+    return value && value[0] && value[0] != '0';
+  };
+  if (!rank && collective == BenchCollective::AllGather) {
+    pathInfo = std::string("selected_backend=") +
+               (ipcOutput ? "cuda_ipc"
+                          : handle.backend == mscclppDeviceCollectiveHostRdma
+                                ? "host_rdma"
+                                : "host");
+    if (verbose())
+      std::fprintf(stderr, "allgather bytes_per_rank=%zu %s (starting)\n",
+                   bytes, pathInfo.c_str());
+  }
   if (!rank && collective == BenchCollective::AllReduce) {
     // bytes is the complete tensor per rank; RS+AG uses shards of bytes / nranks.
     auto plan = litePlanAllReduce(handle.allReducePolicy,
@@ -417,10 +429,6 @@ static void runComparison(BenchCollective collective, size_t bytes, int warmups,
     std::printf("allreduce bytes=%zu path=%s chunk_bytes=%zu\n", bytes,
                 liteAllReducePathName(plan.path), plan.chunkBytes);
   }
-  // The selected path is reported on the result line itself (pathInfo), so every
-  // measurement carries the path it measured. UCCL_GPU_DRIVEN_BENCH_VERBOSE=1
-  // also prints it before the run starts, which identifies the path of a hang.
-  std::string pathInfo;
   if (!rank && collective == BenchCollective::ReduceScatter) {
     auto plan = litePlanReduceScatter(handle.reduceScatterPolicy, nranks,
         handle.ranksPerNode, handle.maxBytesPerRank, bytes, true,
@@ -445,10 +453,9 @@ static void runComparison(BenchCollective collective, size_t bytes, int warmups,
                   liteReduceScatterPathName(plan.path), plan.chunkBytes,
                   plan.slots, plan.lead, opts.empty() ? "-" : opts.c_str());
     pathInfo = buffer;
-    if (char const* verbose = std::getenv("UCCL_GPU_DRIVEN_BENCH_VERBOSE"))
-      if (verbose[0] && verbose[0] != '0')
-        std::fprintf(stderr, "reducescatter bytes_per_rank=%zu %s (starting)\n",
-                     bytes, pathInfo.c_str());
+    if (verbose())
+      std::fprintf(stderr, "reducescatter bytes_per_rank=%zu %s (starting)\n",
+                   bytes, pathInfo.c_str());
   }
   if (ipcOutput)
     NCCL_CHECK(mscclppRegisterDeviceCollectiveIpcOutput(
