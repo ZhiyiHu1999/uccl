@@ -5,6 +5,9 @@
 // that implementation, and this file defines non-inline exported functions.
 #pragma once
 
+#include <chrono>
+#include <cstdio>
+
 #include "lite/node_exchange_buffer.hpp"
 #include "network_service.hpp"
 #include "host_staging_buffer.hpp"

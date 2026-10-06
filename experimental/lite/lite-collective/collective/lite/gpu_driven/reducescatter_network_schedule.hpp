@@ -151,11 +151,15 @@ static LiteRsChunk liteRsPrepareNetworkChunk(LiteReduceScatterContext& c,
   unsigned s = w.slot;
   // Local consumers retired before this slot was released; remote ACK is
   // independent of send completion, and persists across message regimes.
-  if (c.previousAck[s])
-    c.wait(&c.ctrl(true)->value[s][1][c.me], c.previousAck[s]);
-  if (c.previous[s])
-    for (int r = 0; r < c.local; ++r)
-      c.wait(&c.ctrl()->value[s][2][r], c.previous[s]);
+  {
+    LiteReduceScatterContext::Timed timed(c.trace,
+                                          LiteReduceScatterContext::Trace::Credit);
+    if (c.previousAck[s])
+      c.wait(&c.ctrl(true)->value[s][1][c.me], c.previousAck[s]);
+    if (c.previous[s])
+      for (int r = 0; r < c.local; ++r)
+        c.wait(&c.ctrl()->value[s][2][r], c.previous[s]);
+  }
   LiteRsChunkView v;
   v.src = reinterpret_cast<char const*>(task.source) + offset;
   v.s = s;
@@ -193,6 +197,8 @@ static LiteRsChunk liteRsPrepareNetworkChunk(LiteReduceScatterContext& c,
 static void liteRsPostNetworkChunk(LiteReduceScatterContext& c,
                                    LiteRsChunk& w) {
   if (w.posted) return;
+  LiteReduceScatterContext::Timed timed(c.trace,
+                                        LiteReduceScatterContext::Trace::Post);
   c.event(c.postEvents[w.slot]);
   size_t off = c.offset(w.slot, c.me, c.ranks + 4);
   c.postDataAndSignal(w.slot, 0, w.stamp, off, w.bytes);
@@ -222,7 +228,12 @@ static void liteRsFinishNetworkChunk(LiteReduceScatterContext& c,
                                      LiteReduceScatterPlan const& p,
                                      LiteRsChunk const& w) {
   unsigned s = w.slot, remoteRow = c.ranks + 4, ownRow = c.ranks + 5;
-  c.wait(&c.ctrl(true)->value[s][0][c.me], w.stamp);
+  using Trace = LiteReduceScatterContext::Trace;
+  using Timed = LiteReduceScatterContext::Timed;
+  {
+    Timed timed(c.trace, Trace::WaitRemote);
+    c.wait(&c.ctrl(true)->value[s][0][c.me], w.stamp);
+  }
   char* output = reinterpret_cast<char*>(task.destination) + w.offset;
   if (w.cpu || p.cpuFinal) {
     if (!w.cpu) {
@@ -240,6 +251,7 @@ static void liteRsFinishNetworkChunk(LiteReduceScatterContext& c,
       incoming = c.mappedRow(s, c.me, remoteRow, true);
     } else {
       incoming = c.deviceRow(s, c.me, remoteRow);
+      Timed timed(c.trace, Trace::H2d);
       if (w.prefetched)
         c.event(c.events[s]);
       else {
@@ -253,8 +265,10 @@ static void liteRsFinishNetworkChunk(LiteReduceScatterContext& c,
         c.local == 1 ? reinterpret_cast<char const*>(task.source) + w.offset +
                            static_cast<size_t>(c.rank) * task.bytes
                      : c.deviceRow(s, c.me, ownRow);
+    Timed timedCta(c.trace, Trace::Cta);
     c.gpu(output, w.bytes, own, incoming);
   }
+  Timed timedAck(c.trace, Trace::Ack);
   c.barrier(s, 2, w.stamp);
   c.postSignal(s, 1, w.stamp);
   c.previous[s] = c.previousAck[s] = w.stamp;
@@ -267,6 +281,7 @@ static void liteRsFinishNetworkChunk(LiteReduceScatterContext& c,
 // HostStaged) is the strictly sequential CPU host schedule.
 static void liteRsNetwork(LiteReduceScatterContext& c, LiteTask const& task,
                           LiteReduceScatterPlan const& p) {
+  auto totalBegin = std::chrono::steady_clock::now();
   LiteRsChunk pending[5]{};
   size_t prepared = 0, posted = 0, finished = 0;
   size_t chunks = (task.bytes - 1) / p.chunkBytes + 1;
@@ -288,8 +303,12 @@ static void liteRsNetwork(LiteReduceScatterContext& c, LiteTask const& task,
     if (i >= c.slots) finishUpTo(i - c.slots + 1);
     for (size_t j = finished; j < prepared; ++j)
       liteRsPrefetch(c, p, pending[j % c.slots]);
-    pending[i % c.slots] =
-        liteRsPrepareNetworkChunk(c, task, p, i * p.chunkBytes, epoch, i);
+    {
+      LiteReduceScatterContext::Timed timed(
+          c.trace, LiteReduceScatterContext::Trace::Prepare);
+      pending[i % c.slots] =
+          liteRsPrepareNetworkChunk(c, task, p, i * p.chunkBytes, epoch, i);
+    }
     ++prepared;
     size_t target = prepared > p.lead ? prepared - p.lead : 0;
     if (p.eagerPost)
@@ -299,4 +318,23 @@ static void liteRsNetwork(LiteReduceScatterContext& c, LiteTask const& task,
   }
   postUpTo(chunks);
   finishUpTo(chunks);
+  if (c.trace.on) {
+    c.trace.us[LiteReduceScatterContext::Trace::Total] +=
+        std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - totalBegin).count();
+    ++c.trace.calls;
+    if (c.trace.calls % 50 == 0 && c.rank == 0) {
+      auto& t = c.trace;
+      double n = static_cast<double>(t.calls);
+      std::fprintf(stderr,
+                   "[rs-trace] calls=%llu chunks=%zu avg_us/call: total=%.1f "
+                   "credit=%.1f prepare=%.1f post=%.1f wait_remote=%.1f h2d=%.1f "
+                   "cta=%.1f ack=%.1f\n",
+                   static_cast<unsigned long long>(t.calls), chunks,
+                   t.us[7] / n, t.us[0] / n, t.us[1] / n, t.us[2] / n,
+                   t.us[3] / n, t.us[4] / n, t.us[5] / n, t.us[6] / n);
+      t.calls = 0;
+      for (auto& v : t.us) v = 0;
+    }
+  }
 }

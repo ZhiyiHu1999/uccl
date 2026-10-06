@@ -45,7 +45,27 @@ struct LiteReduceScatterContext {
   };
   Wire wire[2];
   mscclpp::Transport ibTransport = mscclpp::Transport::Unknown;
-  static constexpr uint64_t kWireSignalEvery = 128;  mscclpp::RegisteredMemory sendMemory, recvMemory, remoteMemory;
+  // UCCL_GPU_DRIVEN_RS_TRACE=1: accumulate the time the two-node schedule spends in
+  // each stage and print the per-call averages every 50 calls from rank 0.
+  struct Trace {
+    enum Stage { Credit, Prepare, Post, WaitRemote, H2d, Cta, Ack, Total, kStages };
+    bool on = false;
+    uint64_t calls = 0;
+    double us[kStages] = {};
+  } trace;
+  struct Timed {
+    Trace& t;
+    int stage;
+    std::chrono::steady_clock::time_point begin;
+    Timed(Trace& tr, int s) : t(tr), stage(s) {
+      if (t.on) begin = std::chrono::steady_clock::now();
+    }
+    ~Timed() {
+      if (t.on)
+        t.us[stage] += std::chrono::duration<double, std::micro>(
+                           std::chrono::steady_clock::now() - begin).count();
+    }
+  };  static constexpr uint64_t kWireSignalEvery = 128;  mscclpp::RegisteredMemory sendMemory, recvMemory, remoteMemory;
   LiteTaskFifo* fifo = nullptr;
   std::atomic<bool>* stop = nullptr;
 
@@ -479,6 +499,8 @@ static void prepareLiteReduceScatter(LiteReduceScatterContext& c,
     auto memory = comm->comm->recvMemory(peer, tag + 1);
     c.connection = connection.get();
     c.ibTransport = transport;
+    if (char const* v = std::getenv("UCCL_GPU_DRIVEN_RS_TRACE"))
+      c.trace.on = v[0] && v[0] != '0';
     if (c.local == 1) c.connection2 = second.get();
     c.remoteMemory = memory.get();
     // Needs the remote memory registered above.
