@@ -480,9 +480,10 @@ static void prepareLiteReduceScatter(LiteReduceScatterContext& c,
     c.connection = connection.get();
     c.ibTransport = transport;
     if (c.local == 1) c.connection2 = second.get();
+    c.remoteMemory = memory.get();
+    // Needs the remote memory registered above.
     c.wireOpen(0, c.connection);
     if (c.local == 1) c.wireOpen(1, c.connection2);
-    c.remoteMemory = memory.get();
   }
 }
 
