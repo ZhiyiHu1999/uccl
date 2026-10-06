@@ -1,6 +1,9 @@
 #pragma once
 #include <type_traits>
 
+// Device primitives (liteRsSum etc.) used by the phase loop below.
+#include "reducescatter_primitives.cuh"
+
 // Shared primitive of every optimization path: one whole invocation occupies one
 // FIFO descriptor tagged with plan.path. While the path's CPU schedule (the
 // like-named function in reducescatter_*_schedule.hpp) progresses DMA/RDMA, each
@@ -13,7 +16,6 @@ static __device__ __forceinline__ int liteRsInvokeTask(
   __shared__ float const* inputs[4];
   __shared__ float* output;
   unsigned tid = mscclppDeviceCollectiveThreadId();
-  unsigned threads = mscclppDeviceCollectiveThreadCount();
   auto* control = &h.tasks->reduceScatter;
   // Input may have been produced by this CTA inside the same user kernel.
   // Publish every lane's writes before the service can start D2H/IPC DMA.
@@ -65,16 +67,17 @@ static __device__ __forceinline__ int liteRsInvokeTask(
     __syncthreads();
     if (status) return status;
     if (!sources) return mscclppDeviceCollectiveSuccess;
-    for (size_t i = tid; i < count; i += threads) {
-      // Payload may have been updated by DMA/another GPU while this kernel
-      // remains resident. Volatile loads prevent reusing a prior phase's value.
-      float value = reinterpret_cast<float const volatile*>(inputs[0])[i];
-      for (int r = 1; r < sources; ++r)
-        value += reinterpret_cast<float const volatile*>(inputs[r])[i];
-      output[i] = value;
+    // Payload may have been updated by DMA/another GPU while this kernel remains
+    // resident, so liteRsSum bypasses the caches; it also uses 16-byte loads with
+    // several in flight per thread (a scalar loop here limited a two-node chunk
+    // add to about 3 GB/s) and ends with the system fence and CTA barrier.
+    {
+      char const* rows[4];
+      for (int r = 0; r < sources; ++r)
+        rows[r] = reinterpret_cast<char const*>(inputs[r]);
+      liteRsSum(reinterpret_cast<char*>(output), rows, sources,
+                count * sizeof(float));
     }
-    __threadfence_system();
-    __syncthreads();
     if (!tid)
       liteStoreRelease(
           reinterpret_cast<unsigned long long*>(&control->completed), phase);
@@ -95,7 +98,6 @@ static __device__ __forceinline__ int liteRsInvokePath(
 }
 
 // Per-path device entries live in their own files, one function per plan path.
-#include "reducescatter_primitives.cuh"
 #include "reducescatter_ipc.cuh"
 #include "reducescatter_host.cuh"
 #include "reducescatter_two_rank.cuh"

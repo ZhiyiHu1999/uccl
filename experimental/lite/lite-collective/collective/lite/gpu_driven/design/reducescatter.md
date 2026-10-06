@@ -188,7 +188,8 @@ rank has its own connection to the same-local-rank peer on the other node.
 in each stage of `liteRsNetwork` (`credit` = waiting for the previous ACK of a slot, `prepare`
 = local phases and the D2H enqueue, `post` = waiting for the D2H event and posting RDMA,
 `wait_remote` = waiting for the peer's data, `h2d` = the copy back to the GPU, `cta` = the CTA
-add phase, `ack` = barrier and ACK post). Use it to see which stage dominates before tuning.
+add phase, `ack` = barrier and ACK post). Use it to see which stage dominates before tuning. (A trace of 2n×1g showed the CTA add phase at
+about 80% of the time while the phase loop used a scalar load loop; it now shares `liteRsSum`.)
 
 ## RDMA posting
 

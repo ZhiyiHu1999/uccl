@@ -78,6 +78,17 @@ post eagerly. Untested; re-measure 1 MiB..1 GiB. If it is still below NCCL, the 
 issuing the CTA add of a chunk asynchronously (a request ring for the phase protocol) so that the
 H2D wait and the CTA phase leave the service thread's critical path.
 
+## 2n×1g trace result and the CTA phase loop (2026-10-06)
+
+`UCCL_GPU_DRIVEN_RS_TRACE=1` on 2n×1g TwoRankPipeline (per call, µs): the CTA add phase (`cta`)
+was 1149 of 1541 (4 MiB, 4 chunks), 4582 of 5548 (16 MiB) and 24354 of 27401 (64 MiB), about 300–380 µs
+per 1 MiB chunk (3 GB/s); `wait_remote`, `post`, `ack` were a few µs per chunk and `h2d` about
+30 µs per chunk. The phase loop of the whole-invocation task (`liteRsInvokeTask`) still used the
+scalar volatile loop that `liteRsSum` replaced for the single-node paths; it now calls
+`liteRsSum` (16-byte uncached loads, four per thread in flight). This affects every two-node
+path and the AllReduce small / ring paths, not only 2n×1g. Untested; re-measure with the trace
+on to see the new `cta` share.
+
 ## Target-machine benchmark matrix
 
 Use the existing benchmark; it performs untimed correctness preflight before
