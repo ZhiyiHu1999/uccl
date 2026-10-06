@@ -118,11 +118,15 @@ for variable in \
   fi
 done
 
-# RS policy must match on remote MPI ranks as well as local ranks.
+# RS and AllReduce policy must match on remote MPI ranks as well as local ranks;
+# the benchmark's own knobs are forwarded so every rank launches the same way.
 while IFS= read -r variable; do
-  if [[ "${variable}" == MSCCLPP_NCCL_RS_* ]]; then
-    MPI_ARGS+=(-x "${variable}")
-  fi
+  case "${variable}" in
+    MSCCLPP_NCCL_RS_* | MSCCLPP_NCCL_AR_* | MSCCLPP_NCCL_2RANK_RING_* | \
+    UCCL_GPU_DRIVEN_BENCH_*)
+      MPI_ARGS+=(-x "${variable}")
+      ;;
+  esac
 done < <(compgen -e)
 
 mkdir -p "$(dirname "${RESULT_FILE}")"
