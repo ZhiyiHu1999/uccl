@@ -69,6 +69,12 @@ struct DeviceCollectiveContext {
   unsigned long long* localEpoch = nullptr;
   LiteAllGatherGridState* allGatherGridState = nullptr;
   size_t maxBytesPerRank = 0;
+  // Row bytes of the two-node host-RDMA payload slab. Equals maxBytesPerRank
+  // unless UCCL_GPU_DRIVEN_STAGING_MAX_BYTES caps it: ReduceScatter/AllReduce
+  // capacities are complete tensors (R times an AllGather row), and a slab sized
+  // by them would need 2 slots x 2 x groupSize x capacity of shared memory.
+  size_t stagingBytes = 0;
+  size_t staging() const { return stagingBytes ? stagingBytes : maxBytesPerRank; }
   int rank = -1;
   int nranks = 0;
   int cudaDevice = -1;
@@ -189,6 +195,7 @@ struct DeviceCollectiveConfig {
   LiteAllGatherPolicy policy;
   LiteReduceScatterPolicy reduceScatterPolicy;
   LiteAllReducePolicy allReducePolicy;
+  size_t stagingCap;
   int ibCount;
   int numaNode;
 };
@@ -253,7 +260,7 @@ static void runDeviceCollectiveRdmaProxy(DeviceCollectiveContext* context) {
     mscclpp::CudaDeviceGuard guard(context->cudaDevice);
     NebCtrl* control = context->nodeBuffer->control();
     size_t slotStride = static_cast<size_t>(2 * context->groupSize) *
-                        (context->maxBytesPerRank + 16);
+                        (context->staging() + 16);
     for (uint64_t epoch = 1;
          !context->stopRdmaProxy.load(std::memory_order_acquire); ++epoch) {
       int slot =
@@ -275,7 +282,7 @@ static void runDeviceCollectiveRdmaProxy(DeviceCollectiveContext* context) {
       size_t slotOffset = static_cast<size_t>(slot) * slotStride;
       uint64_t descriptor = control->gpuBytes[slot][context->groupBase];
       size_t bytes = static_cast<size_t>(descriptor & ~kLiteNetworkMask);
-      if (!bytes || bytes > context->maxBytesPerRank)
+      if (!bytes || bytes > context->staging())
         throw mscclpp::Error("invalid device collective chunk size",
                              mscclpp::ErrorCode::InvalidUsage);
       for (int local = context->groupBase;
@@ -285,7 +292,7 @@ static void runDeviceCollectiveRdmaProxy(DeviceCollectiveContext* context) {
                                mscclpp::ErrorCode::InvalidUsage);
       bool packed = descriptor & kLitePackedNetworkBit;
       bool compact = descriptor & kLiteCompactNetworkBit;
-      size_t row = packed ? bytes : context->maxBytesPerRank;
+      size_t row = packed ? bytes : context->staging();
       if (compact) row = ((bytes + 7) & ~size_t{7}) + 8;
       size_t nodeOffset =
           static_cast<size_t>(context->rank / context->nRanksPerNode) *
@@ -459,7 +466,7 @@ static void initializeHostRdmaDeviceCollective(DeviceCollectiveContext& context,
       (1 - nodeId) * context.nRanksPerNode + context.groupBase;
   bool isLeader = context.rank == context.localLeader;
   size_t slotStride = static_cast<size_t>(2 * context.groupSize) *
-                      (context.maxBytesPerRank + 16);
+                      (context.staging() + 16);
   size_t slabBytes = MSCCLPP_DEVICE_COLLECTIVE_SLOTS * slotStride;
   auto nonce =
       static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(comm));
@@ -580,6 +587,7 @@ static void fillDeviceCollectiveHandle(
   handle->localEpoch = context.localEpoch;
   handle->allGatherGridState = context.allGatherGridState;
   handle->maxBytesPerRank = context.maxBytesPerRank;
+  handle->stagingBytes = context.staging();
   handle->rank = context.rank;
   handle->nranks = context.nranks;
   handle->backend = context.backend;
@@ -612,6 +620,7 @@ static void fillDeviceCollectiveHandle(
     handle->slab = raw.slabDev;
     handle->control = raw.ctrlDev;
     handle->maxBytesPerRank = raw.bytesPerRank;
+    handle->stagingBytes = raw.bytesPerRank;
     handle->slotStride = raw.slotStride;
     handle->counterStride = raw.counterStride;
     return;
@@ -625,7 +634,7 @@ static void fillDeviceCollectiveHandle(
     for (int g = 0; g < count; ++g) {
       auto const& group = context.groups.empty() ? context : *context.groups[g];
       size_t slotStride = static_cast<size_t>(2 * group.groupSize) *
-                          (group.maxBytesPerRank + 16);
+                          (group.staging() + 16);
       char* send = const_cast<char*>(group.nodeBuffer->sendDevicePtr());
       char* control = group.nodeBuffer->controlDevicePtr();
       handle->groupReusable[g] = reinterpret_cast<unsigned long long*>(
@@ -803,6 +812,23 @@ mscclppGetDeviceCollectiveHandle(ncclComm_t comm, size_t maxBytesPerRank,
     LiteAllGatherPolicy policy;
     auto rsPolicy = readLiteReduceScatterPolicy();
     auto arPolicy = readLiteAllReducePolicy();
+    // Optional cap of the two-node payload slab rows (0 = none); see
+    // DeviceCollectiveContext::stagingBytes. Every rank must use the same value.
+    size_t stagingCap = 0;
+    if (char const* value = std::getenv("UCCL_GPU_DRIVEN_STAGING_MAX_BYTES")) {
+      char* end = nullptr;
+      unsigned long long parsed = std::strtoull(value, &end, 0);
+      size_t scale = 1;
+      if (end != value && *end) {
+        if ((*end == 'k' || *end == 'K') && !end[1]) scale = size_t{1} << 10;
+        else if ((*end == 'm' || *end == 'M') && !end[1]) scale = size_t{1} << 20;
+        else if ((*end == 'g' || *end == 'G') && !end[1]) scale = size_t{1} << 30;
+        else parsed = 0;
+      }
+      if (end != value && parsed <= SIZE_MAX / scale) stagingCap = parsed * scale;
+      // AllGather's ordered small messages stage up to 2 MiB per rank.
+      if (stagingCap && stagingCap < size_t{4} << 20) stagingCap = size_t{4} << 20;
+    }
     auto enabled = [](char const* key, bool fallback) {
       char const* value = std::getenv(key);
       return value ? std::strcmp(value, "0") != 0 : fallback;
@@ -836,6 +862,7 @@ mscclppGetDeviceCollectiveHandle(ncclComm_t comm, size_t maxBytesPerRank,
                      policy,
                      rsPolicy,
                      arPolicy,
+                     stagingCap,
                      0,
                      -1};
     try {
@@ -862,7 +889,8 @@ mscclppGetDeviceCollectiveHandle(ncclComm_t comm, size_t maxBytesPerRank,
           config.policy.coopMaxBytes != policy.coopMaxBytes ||
           config.policy.chunkBytes != policy.chunkBytes ||
           !sameLiteReduceScatterPolicy(config.reduceScatterPolicy, rsPolicy) ||
-          !sameLiteAllReducePolicy(config.allReducePolicy, arPolicy)) {
+          !sameLiteAllReducePolicy(config.allReducePolicy, arPolicy) ||
+          config.stagingCap != stagingCap) {
         throw mscclpp::Error(
             "all ranks must initialize the same device collective backend "
             "and maxBytesPerRank",
@@ -911,6 +939,8 @@ mscclppGetDeviceCollectiveHandle(ncclComm_t comm, size_t maxBytesPerRank,
     if (context->localEpoch == nullptr) {
       context->maxBytesPerRank =
           (maxBytesPerRank + 15U) & ~static_cast<size_t>(15U);
+      if (twoNodes && stagingCap && stagingCap < context->maxBytesPerRank)
+        context->stagingBytes = (stagingCap + 15U) & ~static_cast<size_t>(15U);
       context->allGatherPolicy = policy;
       context->dualRail = twoNodes && configs[0].ibCount > 1 &&
                           configs[nRanksPerNode].ibCount > 1;

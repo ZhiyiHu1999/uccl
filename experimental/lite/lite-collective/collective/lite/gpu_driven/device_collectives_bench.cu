@@ -483,9 +483,12 @@ static void runComparison(BenchCollective collective, size_t bytes, int warmups,
         CUDA_CHECK(cudaDeviceSynchronize());
       }
   } else {
+    // Generic (arithmetic-template) reductions stage through the payload slab and
+    // need mapped payloads; inputs above one staging row are processed in slices.
+    bool genericOk = handle.reductionsMapped;
     for (bool inPlace : {false, true})
       for (auto op : {liteReduceSum, liteReduceMin, liteReduceMax}) {
-        if (!handle.reductionsMapped && op != liteReduceSum) continue;
+        if (!genericOk && op != liteReduceSum) continue;
         // In-place AllReduce reduces inside one buffer. With an IPC-ring
         // AllGather stage that buffer must be the registered output region.
         float* source = input;
@@ -496,7 +499,7 @@ static void runComparison(BenchCollective collective, size_t bytes, int warmups,
                                    inPlace, op, errors);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
-        if (!handle.reductionsMapped) continue;
+        if (!genericOk) continue;
         checkReduction<<<1, benchThreads()>>>(handle, reinterpret_cast<int*>(source),
                                    reinterpret_cast<int*>(output), count,
                                    collective == BenchCollective::ReduceScatter,
@@ -505,7 +508,8 @@ static void runComparison(BenchCollective collective, size_t bytes, int warmups,
         CUDA_CHECK(cudaDeviceSynchronize());
       }
   }
-  if (!rank && collective == BenchCollective::ReduceScatter && !handle.reductionsMapped)
+  if (!rank && collective == BenchCollective::ReduceScatter &&
+      !handle.reductionsMapped)
     std::printf("reducescatter preflight coverage=float/sum; generic int/min/max unavailable without mapped payloads\n");
   unsigned localErrors = 0, totalErrors = 0;
   CUDA_CHECK(cudaMemcpy(&localErrors, errors, sizeof(unsigned),
@@ -726,6 +730,12 @@ int main(int argc, char** argv) {
   if (backend == mscclppDeviceCollectiveHostMemory &&
       !std::getenv("MSCCLPP_NCCL_HOST_ALLGATHER"))
     setenv("MSCCLPP_NCCL_HOST_ALLGATHER", "1", 0);
+  // ReduceScatter capacities are complete inputs (R times an AllGather row). Its
+  // optimized paths never use the two-node generic payload slab, whose size
+  // follows the capacity, so a ReduceScatter-only run caps it (16 MiB rows);
+  // generic reductions then stage larger inputs in slices.
+  if (options.collective == "reducescatter")
+    setenv("UCCL_GPU_DRIVEN_STAGING_MAX_BYTES", "16M", 0);
   mscclppDeviceCollectiveHandle_t handle{};
   NCCL_CHECK(
       mscclppGetDeviceCollectiveHandle(comm, maxStagedBytes, backend, &handle));

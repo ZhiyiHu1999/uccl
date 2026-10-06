@@ -55,6 +55,19 @@ for the thread count of the single CTA; the SM budget stays one block. Not compi
 compare HostRing at 1 MiB..1 GiB with 256 and 1024 threads. A previous measurement with
 stuck processes holding the GPUs (NCCL itself ten times slower) must not be used as baseline.
 
+## Two-node capacity (2026-10-06)
+
+`-c reducescatter` with `-e 1G` on 2n×4g crashed in `NodeExchangeBuffer::create` (bus error,
+`/dev/shm` full): the two-node generic payload slab was sized from the 8 GiB ReduceScatter
+capacity. `UCCL_GPU_DRIVEN_STAGING_MAX_BYTES` now caps its rows and the ReduceScatter benchmark
+sets 16 MiB by default; see design/reducescatter.md. Generic ReduceScatter / AllReduce larger than
+one row are processed in slices (gather-staged shard slices for ReduceScatter, contiguous slices for
+AllReduce), aligned with the CPU reference's chunked staging. Untested: compile, a 2n×4g `-e 1G` run,
+slice boundaries (input not a multiple of the slice, last short slice, in-place), generic int/min/max
+above 16 MiB,
+and that AllGather / AllReduce on an uncapped handle are unchanged (the field equals the
+capacity when unset).
+
 ## Target-machine benchmark matrix
 
 Use the existing benchmark; it performs untimed correctness preflight before

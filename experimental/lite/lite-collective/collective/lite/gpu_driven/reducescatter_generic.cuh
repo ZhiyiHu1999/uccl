@@ -2,6 +2,64 @@
 // Block-scoped ReduceScatter.  Each rank contributes nranks * recvCount
 // elements.  Rank r receives the reduction of shard r, containing recvCount
 // elements.  T must support +, <, and >.
+// Chunked Generic ReduceScatter, the staging of the CPU reference
+// (runSendRecvReduceScatter): the input is processed in slices of `slice` elements
+// of every shard. One epoch stages the j-th slice of all R shards (R * slice
+// elements per rank, a row never exceeds the staging limit) and each rank reduces
+// the slice of its own shard from the rows of all ranks.
+template <typename T>
+static __device__ __forceinline__ int liteReduceScatterGenericChunked(
+    mscclppDeviceCollectiveHandle_t const& h, T const* src, T* dst,
+    size_t recvCount, liteReduceOp op, size_t limit) {
+  __shared__ unsigned long long epoch;
+  __shared__ int slot;
+  __shared__ size_t chunkBytes;
+  __shared__ int chunkCount;
+  size_t ranks = static_cast<size_t>(h.nranks);
+  size_t slice = limit / (ranks * sizeof(T));
+  if (slice == 0) return mscclppDeviceCollectiveInvalidUsage;
+  unsigned int tid = mscclppDeviceCollectiveThreadId();
+  unsigned int threadCount = mscclppDeviceCollectiveThreadCount();
+  for (size_t first = 0; first < recvCount; first += slice) {
+    size_t elems = recvCount - first < slice ? recvCount - first : slice;
+    size_t pieceBytes = elems * sizeof(T);
+    size_t virtualBytes = ranks * pieceBytes;
+    int rc = liteCollectiveBeginBlock(h, src, virtualBytes, &epoch, &slot,
+                                      &chunkBytes, &chunkCount);
+    if (rc != mscclppDeviceCollectiveSuccess) return rc;
+    size_t shardBegin = static_cast<size_t>(h.rank) * elems;
+    size_t shardEnd = shardBegin + elems;
+    for (int chunk = 0; chunk < chunkCount; ++chunk) {
+      size_t byteOffset = static_cast<size_t>(chunk) * chunkBytes;
+      size_t bytes = virtualBytes - byteOffset < chunkBytes
+                         ? virtualBytes - byteOffset
+                         : chunkBytes;
+      rc = liteCollectiveStageGatherChunkBlock(
+          h, reinterpret_cast<char const*>(src), recvCount * sizeof(T),
+          first * sizeof(T), pieceBytes, byteOffset, bytes, chunk, epoch, slot);
+      if (rc != mscclppDeviceCollectiveSuccess) return rc;
+      size_t chunkBegin = byteOffset / sizeof(T);
+      size_t chunkEnd = chunkBegin + bytes / sizeof(T);
+      size_t reduceBegin = chunkBegin > shardBegin ? chunkBegin : shardBegin;
+      size_t reduceEnd = chunkEnd < shardEnd ? chunkEnd : shardEnd;
+      T const* rankZero =
+          reinterpret_cast<T const*>(mscclppDeviceCollectiveSlab(h, slot, 0));
+      for (size_t i = reduceBegin + tid; i < reduceEnd; i += threadCount) {
+        T value = rankZero[i];
+        for (int r = 1; r < h.nranks; ++r) {
+          T const* peer = reinterpret_cast<T const*>(
+              mscclppDeviceCollectiveSlab(h, slot, r));
+          value = liteApplyReduction(value, peer[i], op);
+        }
+        dst[first + (i - shardBegin)] = value;
+      }
+      __syncthreads();
+    }
+    liteCollectiveDoneBlock(h, slot, epoch);
+  }
+  return mscclppDeviceCollectiveSuccess;
+}
+
 template <typename T>
 static __device__ __forceinline__ int liteReduceScatterGenericBlock(
     mscclppDeviceCollectiveHandle_t const& h, T const* src, T* dst,
@@ -41,6 +99,11 @@ static __device__ __forceinline__ int liteReduceScatterGenericBlock(
     __syncthreads();
     return mscclppDeviceCollectiveSuccess;
   }
+  // The input does not fit one staging epoch (two-node slab rows capped by
+  // UCCL_GPU_DRIVEN_STAGING_MAX_BYTES): stage it slice by slice.
+  if (sourceBytes > liteGenericStagingLimit(h))
+    return liteReduceScatterGenericChunked(h, src, dst, recvCount, op,
+                                           liteGenericStagingLimit(h));
   int rc = liteCollectiveBeginBlock(h, src, sourceBytes, &epoch, &slot,
                                     &chunkBytes, &chunkCount);
   if (rc != mscclppDeviceCollectiveSuccess) return rc;

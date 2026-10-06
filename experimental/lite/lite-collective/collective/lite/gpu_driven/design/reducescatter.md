@@ -182,6 +182,26 @@ rank has its own connection to the same-local-rank peer on the other node.
   local partial and do the final add on the CPU. Defaults are in the pipeline policy
   table below.
 
+## Capacity and the two-node payload slab
+
+`maxBytesPerRank` of a ReduceScatter handle is the complete input (`R × B`), R times the row
+of an AllGather handle. The two-node host-RDMA backend sizes its generic payload slab from the
+same value (`2 slots × 2 × groupSize × (capacity + 16)` bytes for each of the send and receive
+slabs, shared memory in `/dev/shm`). Only the arithmetic-template Generic reductions use rows of
+that size; the optimized ReduceScatter paths and every AllGather path use their own compact
+buffers (AllGather network contexts, packed rows of at most a few MiB). With `-e 1G` on 2n×4g
+the capacity is 8 GiB and the slab alone would need about 256 GiB.
+
+`UCCL_GPU_DRIVEN_STAGING_MAX_BYTES` (K/M/G suffixes, at least 4 MiB, all ranks must agree)
+caps the row bytes of that slab. Unset keeps the capacity-sized rows. With a cap, Generic
+reductions larger than one row are processed in slices instead, the chunked staging of the CPU
+reference (`runSendRecvReduceScatter`): Generic ReduceScatter stages the j-th slice of every
+shard per epoch (a row holds `R × slice` elements, ranks reduce the slice of their own shard),
+Generic AllReduce reduces contiguous slices of one epoch each. Inputs that fit a row take the
+unchanged single-epoch protocol. Two-node only; other backends ignore the cap. The ReduceScatter
+benchmark sets the cap to 16 MiB by default (`-c reducescatter`); its preflight still covers
+the generic int/min/max paths, now through the sliced staging for large inputs.
+
 ## Chunk, pipeline and tuning
 
 `CHUNK_BYTES` defaults to a 2 MiB capacity cap. The effective chunk is chosen by

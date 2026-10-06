@@ -57,6 +57,8 @@ typedef struct mscclppDeviceCollectiveHandle {
   size_t publishedBytesSlotStride;
   unsigned long long* localEpoch;
   size_t maxBytesPerRank;
+  // Row bytes of the payload slab (host RDMA: may be capped below maxBytesPerRank).
+  size_t stagingBytes;
   size_t slotStride;
   size_t counterStride;
   int rank;
@@ -161,7 +163,7 @@ static __device__ __forceinline__ char* mscclppDeviceCollectiveSlab(
     mscclppDeviceCollectiveHandle_t const& h, int slot, int rank,
     size_t networkRowBytes = 0) {
   if (h.backend == mscclppDeviceCollectiveHostRdma) {
-    size_t row = networkRowBytes ? networkRowBytes : h.maxBytesPerRank;
+    size_t row = networkRowBytes ? networkRowBytes : h.stagingBytes;
     return h.peerSlabs[rank] + slot * h.peerSlabSlotStride[rank] +
            h.peerSlabIndex[rank] * row;
   }
@@ -344,7 +346,10 @@ static __device__ __forceinline__ int liteCollectiveBeginBlock(
         liteLoadAcquire(reinterpret_cast<unsigned long long*>(&h.tasks->error)))
       status = mscclppDeviceCollectiveTransportError;
     if (!mscclppDeviceCollectiveHandleValid(h) || srcVoid == nullptr ||
-        sourceBytes == 0 || sourceBytes > h.maxBytesPerRank || h.nranks < 1 ||
+        sourceBytes == 0 || sourceBytes > h.maxBytesPerRank ||
+        (h.backend == mscclppDeviceCollectiveHostRdma &&
+         sourceBytes > h.stagingBytes) ||
+        h.nranks < 1 ||
         h.nranks > MSCCLPP_DEVICE_COLLECTIVE_MAX_RANKS || h.rank < 0 ||
         h.rank >= h.nranks) {
       status = mscclppDeviceCollectiveInvalidArgument;
@@ -386,19 +391,13 @@ static __device__ __forceinline__ int liteCollectiveBeginBlock(
   return mscclppDeviceCollectiveSuccess;
 }
 
-// Publish one portion of this rank's input and wait until the corresponding
-// portion from every rank is readable.  All block threads participate.
-static __device__ __forceinline__ int liteCollectiveStageChunkBlock(
-    mscclppDeviceCollectiveHandle_t const& h, void const* srcVoid,
-    size_t offset, size_t bytes, int chunk, unsigned long long epoch,
-    int slot) {
-  char const* src = static_cast<char const*>(srcVoid);
-  char* selfSlab = mscclppDeviceCollectiveSlab(h, slot, h.rank);
+// Publish chunk `chunk` of this rank's staged row and wait until the same chunk
+// of every rank is readable. The row bytes must already be written (and the
+// writers synchronized). All block threads participate.
+static __device__ __forceinline__ int liteCollectivePublishChunkBlock(
+    mscclppDeviceCollectiveHandle_t const& h, size_t bytes, int chunk,
+    unsigned long long epoch, int slot) {
   __shared__ int stageStatus;
-  liteCollectiveCopyBlock(selfSlab + offset, src + offset, bytes);
-  __threadfence_system();
-  __syncthreads();
-
   if (mscclppDeviceCollectiveThreadId() == 0) {
     __threadfence_system();
     if (h.backend == mscclppDeviceCollectiveHostRdma) {
@@ -423,6 +422,51 @@ static __device__ __forceinline__ int liteCollectiveStageChunkBlock(
   __syncthreads();
   __threadfence_system();
   return stageStatus;
+}
+
+// Publish one portion of this rank's input and wait until the corresponding
+// portion from every rank is readable.  All block threads participate.
+static __device__ __forceinline__ int liteCollectiveStageChunkBlock(
+    mscclppDeviceCollectiveHandle_t const& h, void const* srcVoid,
+    size_t offset, size_t bytes, int chunk, unsigned long long epoch,
+    int slot) {
+  char const* src = static_cast<char const*>(srcVoid);
+  char* selfSlab = mscclppDeviceCollectiveSlab(h, slot, h.rank);
+  liteCollectiveCopyBlock(selfSlab + offset, src + offset, bytes);
+  __threadfence_system();
+  __syncthreads();
+  return liteCollectivePublishChunkBlock(h, bytes, chunk, epoch, slot);
+}
+
+// Like StageChunkBlock for a virtual source made of equal pieces taken from a
+// strided input: virtual bytes [t*pieceBytes, (t+1)*pieceBytes) come from
+// src + t*shardStride + pieceOffset. ReduceScatter stages the j-th slice of every
+// shard this way, so a row holds one slice of each shard instead of the input.
+static __device__ __forceinline__ int liteCollectiveStageGatherChunkBlock(
+    mscclppDeviceCollectiveHandle_t const& h, char const* src,
+    size_t shardStride, size_t pieceOffset, size_t pieceBytes, size_t offset,
+    size_t bytes, int chunk, unsigned long long epoch, int slot) {
+  char* selfSlab = mscclppDeviceCollectiveSlab(h, slot, h.rank);
+  size_t end = offset + bytes;
+  for (size_t v = offset; v < end;) {
+    size_t piece = v / pieceBytes;
+    size_t within = v - piece * pieceBytes;
+    size_t n = pieceBytes - within < end - v ? pieceBytes - within : end - v;
+    liteCollectiveCopyBlock(selfSlab + v,
+                            src + piece * shardStride + pieceOffset + within, n);
+    v += n;
+  }
+  __threadfence_system();
+  __syncthreads();
+  return liteCollectivePublishChunkBlock(h, bytes, chunk, epoch, slot);
+}
+
+// Largest source a single generic staging epoch can hold. Larger reductions are
+// processed in slices, like the CPU reference's chunked staging.
+static __device__ __forceinline__ size_t liteGenericStagingLimit(
+    mscclppDeviceCollectiveHandle_t const& h) {
+  return h.backend == mscclppDeviceCollectiveHostRdma ? h.stagingBytes
+                                                      : h.maxBytesPerRank;
 }
 
 static __device__ __forceinline__ void liteCollectiveDoneBlock(
@@ -553,12 +597,12 @@ static __device__ __forceinline__ int liteAllGatherBlock(
   }
 }
 
-// Block-scoped full-tensor AllReduce (the Generic path of liteAllReduceBlock):
-// every rank stages the complete tensor through the mapped payload slab and
-// reduces it element-wise. Each rank contributes count elements and receives
+// One staging epoch of the Generic AllReduce: every rank stages `count` elements
+// through the payload slab and reduces them element-wise (count * sizeof(T) must
+// fit liteGenericStagingLimit). Each rank contributes count elements and receives
 // the element-wise reduction of all ranks.  T must support +, <, and >.
 template <typename T>
-static __device__ __forceinline__ int liteAllReduceGenericBlock(
+static __device__ __forceinline__ int liteAllReduceGenericSlice(
     mscclppDeviceCollectiveHandle_t const& h, T const* src, T* dst,
     size_t count, liteReduceOp op = liteReduceSum) {
   __shared__ unsigned long long epoch;
@@ -621,6 +665,25 @@ static __device__ __forceinline__ int liteAllReduceGenericBlock(
     __syncthreads();
   }
   liteCollectiveDoneBlock(h, slot, epoch);
+  return mscclppDeviceCollectiveSuccess;
+}
+
+// Block-scoped full-tensor AllReduce (the Generic path of liteAllReduceBlock).
+// Tensors that fit one staging epoch take it as before; larger ones, possible
+// when UCCL_GPU_DRIVEN_STAGING_MAX_BYTES caps the two-node slab, are reduced in
+// contiguous slices of one epoch each, the chunked staging of the CPU reference.
+template <typename T>
+static __device__ __forceinline__ int liteAllReduceGenericBlock(
+    mscclppDeviceCollectiveHandle_t const& h, T const* src, T* dst,
+    size_t count, liteReduceOp op = liteReduceSum) {
+  size_t slice = liteGenericStagingLimit(h) / sizeof(T);
+  if (h.nranks == 1 || slice == 0 || count <= slice)
+    return liteAllReduceGenericSlice(h, src, dst, count, op);
+  for (size_t offset = 0; offset < count; offset += slice) {
+    size_t n = count - offset < slice ? count - offset : slice;
+    int rc = liteAllReduceGenericSlice(h, src + offset, dst + offset, n, op);
+    if (rc != mscclppDeviceCollectiveSuccess) return rc;
+  }
   return mscclppDeviceCollectiveSuccess;
 }
 

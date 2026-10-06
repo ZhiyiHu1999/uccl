@@ -85,6 +85,8 @@ not device-callable. No size crossover is invented: `AR_RS_AG_MIN_BYTES` default
 * **Generic**: the original path: each rank stages the complete tensor chunk by chunk through
   the payload slab and reduces it element-wise; it serves any supported type/operation and
   irregular counts (including `C < R`). It never truncates the tensor to make `C` divisible.
+  A tensor larger than one staging epoch (two-node slab rows capped by
+  `UCCL_GPU_DRIVEN_STAGING_MAX_BYTES`) is reduced in contiguous slices of one epoch each.
 
 ## Policy variables
 

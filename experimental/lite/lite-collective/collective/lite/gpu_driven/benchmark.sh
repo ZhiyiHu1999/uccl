@@ -123,7 +123,7 @@ done
 while IFS= read -r variable; do
   case "${variable}" in
     MSCCLPP_NCCL_RS_* | MSCCLPP_NCCL_AR_* | MSCCLPP_NCCL_2RANK_RING_* | \
-    UCCL_GPU_DRIVEN_BENCH_*)
+    UCCL_GPU_DRIVEN_BENCH_* | UCCL_GPU_DRIVEN_STAGING_*)
       MPI_ARGS+=(-x "${variable}")
       ;;
   esac
@@ -243,7 +243,7 @@ if [[ "${SELECTED_COLLECTIVE}" == reducescatter || "${SELECTED_COLLECTIVE}" == a
     && grep -q '^reducescatter preflight coverage=' "${RAW_OUTPUT}"; then
   {
     printf '\n## ReduceScatter notes\n\n```text\n'
-    grep '^reducescatter preflight coverage=' "${RAW_OUTPUT}"
+    grep '^reducescatter preflight coverage=' "${RAW_OUTPUT}" | awk '!seen[$0]++'
     printf '```\n'
   } >>"${RESULT_FILE}"
 fi

@@ -15,11 +15,11 @@ static char* deviceCollectiveHostSlab(DeviceCollectiveContext& c, int slot,
   if (c.hostBuffer) return c.hostBuffer->rankSlabHost(slot, rank);
   auto& group = deviceCollectiveGroup(c, rank);
   size_t row = task.networkFlags & kLitePackedNetworkBit ? task.bytes
-                                                         : c.maxBytesPerRank;
+                                                         : c.staging();
   if (task.networkFlags & kLiteCompactNetworkBit)
     row = ((row + 7) & ~size_t{7}) + 8;
   size_t slotStride =
-      static_cast<size_t>(2 * group.groupSize) * (group.maxBytesPerRank + 16);
+      static_cast<size_t>(2 * group.groupSize) * (group.staging() + 16);
   size_t index = (rank / c.nRanksPerNode) * group.groupSize +
                  rank % c.nRanksPerNode - group.groupBase;
   return group.nodeBuffer->sendPtr(slot * slotStride + index * row);
@@ -182,9 +182,9 @@ static void runDeviceCollectiveService(DeviceCollectiveContext* context) {
           continue;
         }
         if (task.slot < 0 || task.slot >= MSCCLPP_DEVICE_COLLECTIVE_SLOTS ||
-            !task.bytes || task.bytes > c.maxBytesPerRank || !task.epoch ||
+            !task.bytes || task.bytes > c.staging() || !task.epoch ||
             (!c.groups.empty() &&
-             task.bytes > deviceCollectiveGroup(c, c.rank).maxBytesPerRank)) {
+             task.bytes > deviceCollectiveGroup(c, c.rank).staging())) {
           throw mscclpp::Error("invalid device DMA descriptor",
                                mscclpp::ErrorCode::InvalidUsage);
         }
