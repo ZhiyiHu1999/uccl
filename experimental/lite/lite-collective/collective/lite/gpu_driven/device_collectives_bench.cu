@@ -91,9 +91,13 @@ __device__ unsigned char byteValue(int rank, size_t index, int iteration) {
   return static_cast<unsigned char>(rank * 29 + index * 13 + iteration * 7);
 }
 
+// The bench kernels inline every collective path; the bound keeps their register
+// use low enough to launch kBenchMaxThreads threads.
+static constexpr int kBenchMaxThreads = 512;
+
 // Repeated calls inside ONE kernel exercise the actual device-callable API,
 // FIFO wrap, payload-slot retirement and freshly produced input visibility.
-__global__ void checkGather(mscclppDeviceCollectiveHandle_t h, char* input,
+__global__ void __launch_bounds__(kBenchMaxThreads) checkGather(mscclppDeviceCollectiveHandle_t h, char* input,
                             char* output, size_t bytes, bool inPlace,
                             unsigned* errors) {
   for (int iteration = 0; iteration < 9; ++iteration) {
@@ -119,7 +123,7 @@ __device__ int elementValue(int rank, size_t index, int iteration) {
 }
 
 template <typename T>
-__global__ void checkReduction(mscclppDeviceCollectiveHandle_t h, T* input,
+__global__ void __launch_bounds__(kBenchMaxThreads) checkReduction(mscclppDeviceCollectiveHandle_t h, T* input,
                                T* output, size_t count, bool scatter,
                                bool inPlace, liteReduceOp op,
                                unsigned* errors) {
@@ -222,33 +226,33 @@ static void debugProbeHandle(mscclppDeviceCollectiveHandle_t const& handle,
 
 // Threads of the single participating CTA. The SM budget is one CTA; the thread
 // count only changes how much memory-level parallelism that CTA has. Override
-// with UCCL_GPU_DRIVEN_BENCH_THREADS (multiple of 32, at most 1024).
+// with UCCL_GPU_DRIVEN_BENCH_THREADS (multiple of 32, at most 512).
 static int benchThreads() {
   static int threads = [] {
     char const* value = std::getenv("UCCL_GPU_DRIVEN_BENCH_THREADS");
     long parsed = value ? std::strtol(value, nullptr, 10) : 256;
-    return (parsed >= 32 && parsed <= 1024 && parsed % 32 == 0)
+    return (parsed >= 32 && parsed <= kBenchMaxThreads && parsed % 32 == 0)
                ? static_cast<int>(parsed)
                : 256;
   }();
   return threads;
 }
 
-__global__ void allGatherBenchKernel(mscclppDeviceCollectiveHandle_t handle,
+__global__ void __launch_bounds__(kBenchMaxThreads) allGatherBenchKernel(mscclppDeviceCollectiveHandle_t handle,
                                      float const* input, float* output,
                                      size_t count, int* status) {
   int rc = liteAllGatherBlock(handle, input, output, count);
   if (threadIdx.x == 0 && rc) atomicCAS(status, 0, rc);
 }
 
-__global__ void allReduceBenchKernel(mscclppDeviceCollectiveHandle_t handle,
+__global__ void __launch_bounds__(kBenchMaxThreads) allReduceBenchKernel(mscclppDeviceCollectiveHandle_t handle,
                                      float const* input, float* output,
                                      size_t count, int* status) {
   int rc = liteAllReduceBlock(handle, input, output, count, liteReduceSum);
   if (threadIdx.x == 0 && rc) atomicCAS(status, 0, rc);
 }
 
-__global__ void reduceScatterBenchKernel(mscclppDeviceCollectiveHandle_t handle,
+__global__ void __launch_bounds__(kBenchMaxThreads) reduceScatterBenchKernel(mscclppDeviceCollectiveHandle_t handle,
                                          float const* input, float* output,
                                          size_t recvCount, int* status) {
   int rc =
