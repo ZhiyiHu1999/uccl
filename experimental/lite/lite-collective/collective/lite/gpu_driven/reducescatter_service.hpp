@@ -28,6 +28,8 @@ struct LiteReduceScatterContext {
   // One event per slot marking that a chunk's D2H staging finished before its
   // RDMA post (posting is decoupled from preparation, as in the CPU pipelines).
   cudaEvent_t postEvents[5]{};
+  // pairEvents: completion of a hierarchical chunk's partner-row copy.
+  cudaEvent_t pairEvents[5]{};
   LiteRsLayout layout;
   mscclpp::Connection connection;
   // Second independent channel of the two-rank AllReduce ring (2n*1g only).
@@ -86,6 +88,8 @@ struct LiteReduceScatterContext {
     for (auto e : events)
       if (e) cudaEventDestroy(e);
     for (auto e : postEvents)
+      if (e) cudaEventDestroy(e);
+    for (auto e : pairEvents)
       if (e) cudaEventDestroy(e);
     for (auto s : streams)
       if (s) cudaStreamDestroy(s);
@@ -413,6 +417,9 @@ static void prepareLiteReduceScatter(LiteReduceScatterContext& c,
       MSCCLPP_CUDATHROW(
           cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
     for (auto& event : c.postEvents)
+      MSCCLPP_CUDATHROW(
+          cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    for (auto& event : c.pairEvents)
       MSCCLPP_CUDATHROW(
           cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
     info[c.rank].device = comm->cudaDevice;

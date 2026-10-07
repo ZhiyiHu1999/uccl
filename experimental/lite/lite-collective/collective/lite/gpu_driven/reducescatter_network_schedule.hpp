@@ -5,6 +5,8 @@ struct LiteRsChunk {
   size_t offset = 0, bytes = 0;
   unsigned slot = 0;
   bool cpu = false, prefetched = false, posted = false;
+  // pairIssued: the partner-row copy was already issued (hierarchical paths).
+  bool pairIssued = false;
 };
 
 // Common per-chunk state shared by the per-path chunk preparations.
@@ -56,13 +58,14 @@ static void liteRsPrepareTwoRankChunk(LiteReduceScatterContext& c,
 // HierarchicalTwo / HierarchicalFour: local partner exchange (and cross-pair for
 // four GPUs), node partials, remote-owned partial staged for RDMA.
 // scheduleTwoNodeTwoGpuChunk / scheduleChunkLocal.
-static void liteRsPrepareHierarchicalChunk(LiteReduceScatterContext& c,
-                                           LiteTask const& task,
-                                           LiteReduceScatterPlan const& p,
-                                           LiteRsChunk const& w,
-                                           LiteRsChunkView const& v) {
-  auto *src = v.src; unsigned s = v.s, remoteRow = v.remoteRow, ownRow = v.ownRow;
-  int owned = v.owned, remote = v.remote; char* send = v.send;
+// Issues the partner-row copy asynchronously; liteRsPrepareHierarchicalChunk
+// waits for it, so the next chunk's copy can overlap this chunk's CTA phases.
+static void liteRsIssueHierarchicalPair(LiteReduceScatterContext& c,
+                                        LiteTask const& task,
+                                        LiteReduceScatterPlan const& p,
+                                        LiteRsChunk const& w,
+                                        LiteRsChunkView const& v) {
+  auto *src = v.src; unsigned s = v.s;
   int partner = c.me ^ 1;
   // Only the partner's assigned parity of global shards is needed. Keep
   // original row indices in scratch so both 2g and pair/cross-pair use the
@@ -71,7 +74,6 @@ static void liteRsPrepareHierarchicalChunk(LiteReduceScatterContext& c,
   // never share an index.
   int parity = partner & 1;
   char* stage = c.deviceRow(s, p.directPartner ? partner : c.me);
-  {
   LiteReduceScatterContext::Timed timedPair(c.trace, LiteReduceScatterContext::Trace::Pair);
   if (p.partner2d) {
     MSCCLPP_CUDATHROW(cudaMemcpy2DAsync(
@@ -97,7 +99,19 @@ static void liteRsPrepareHierarchicalChunk(LiteReduceScatterContext& c,
                w.bytes);
     }
   }
-  c.drain(0, s);
+  MSCCLPP_CUDATHROW(cudaEventRecord(c.pairEvents[s], c.streams[0]));
+}
+
+static void liteRsPrepareHierarchicalChunk(LiteReduceScatterContext& c,
+                                           LiteTask const& task,
+                                           LiteReduceScatterPlan const& p,
+                                           LiteRsChunk const& w,
+                                           LiteRsChunkView const& v) {
+  auto *src = v.src; unsigned s = v.s, remoteRow = v.remoteRow, ownRow = v.ownRow;
+  int owned = v.owned, remote = v.remote; char* send = v.send;
+  {
+    LiteReduceScatterContext::Timed timedPair(c.trace, LiteReduceScatterContext::Trace::Pair);
+    c.event(c.pairEvents[s]);
   }
   { LiteReduceScatterContext::Timed t(c.trace, LiteReduceScatterContext::Trace::PairBarrier);
     c.barrier(s, 0, w.stamp); }
@@ -136,17 +150,41 @@ static void liteRsPrepareHierarchicalChunk(LiteReduceScatterContext& c,
   reduceNode(true);
   if (!p.mappedSend) {
     LiteReduceScatterContext::Timed t(c.trace, LiteReduceScatterContext::Trace::D2hIssue);
-    c.copy(send, c.deviceRow(s, c.me, remoteRow), w.bytes);
+    // Own stream: the partner-row copy of the next chunk must not queue behind
+    // this D2H (the CTA add above already completed).
+    c.copy(send, c.deviceRow(s, c.me, remoteRow), w.bytes, 2);
   }
   // Remote D2H progresses while this same CTA computes the local partial.
   if (p.splitFinal) reduceNode(false);
 }
 
-static LiteRsChunk liteRsPrepareNetworkChunk(LiteReduceScatterContext& c,
-                                             LiteTask const& task,
-                                             LiteReduceScatterPlan const& p,
-                                             size_t offset, uint64_t epoch,
-                                             size_t index) {
+static bool liteRsHierarchical(LiteReduceScatterPlan const& p) {
+  return p.path == LiteReduceScatterPath::HierarchicalTwo ||
+         p.path == LiteReduceScatterPath::HierarchicalFour;
+}
+
+static LiteRsChunkView liteRsChunkView(LiteReduceScatterContext& c,
+                                       LiteTask const& task,
+                                       LiteRsChunk const& w) {
+  LiteRsChunkView v;
+  v.src = reinterpret_cast<char const*>(task.source) + w.offset;
+  v.s = w.slot;
+  v.remoteRow = c.ranks + 4;
+  v.ownRow = c.ranks + 5;
+  v.owned = c.rank;
+  v.remote = (1 - c.node) * c.local + c.me;
+  v.send = c.hostRow(w.slot, c.me, v.remoteRow);
+  return v;
+}
+
+// Takes the slot (credits) and, on the hierarchical paths, starts the
+// asynchronous partner-row copy. Everything that waits for the partner or runs
+// CTA phases is in liteRsPrepareNetworkChunk.
+static LiteRsChunk liteRsBeginNetworkChunk(LiteReduceScatterContext& c,
+                                           LiteTask const& task,
+                                           LiteReduceScatterPlan const& p,
+                                           size_t offset, uint64_t epoch,
+                                           size_t index) {
   LiteRsChunk w;
   w.stamp = liteRsStamp(epoch, index + 1);
   w.offset = offset;
@@ -168,14 +206,19 @@ static LiteRsChunk liteRsPrepareNetworkChunk(LiteReduceScatterContext& c,
       for (int r = 0; r < c.local; ++r)
         c.wait(&c.ctrl()->value[s][2][r], c.previous[s]);
   }
-  LiteRsChunkView v;
-  v.src = reinterpret_cast<char const*>(task.source) + offset;
-  v.s = s;
-  v.remoteRow = c.ranks + 4;
-  v.ownRow = c.ranks + 5;
-  v.owned = c.rank;
-  v.remote = (1 - c.node) * c.local + c.me;
-  v.send = c.hostRow(s, c.me, v.remoteRow);
+  if (liteRsHierarchical(p)) {
+    liteRsIssueHierarchicalPair(c, task, p, w, liteRsChunkView(c, task, w));
+    w.pairIssued = true;
+  }
+  return w;
+}
+
+static void liteRsPrepareNetworkChunk(LiteReduceScatterContext& c,
+                                      LiteTask const& task,
+                                      LiteReduceScatterPlan const& p,
+                                      LiteRsChunk const& w) {
+  unsigned s = w.slot;
+  LiteRsChunkView v = liteRsChunkView(c, task, w);
   switch (p.path) {
     case LiteReduceScatterPath::SmallHost:
     case LiteReduceScatterPath::HostStaged:
@@ -196,8 +239,8 @@ static LiteRsChunk liteRsPrepareNetworkChunk(LiteReduceScatterContext& c,
   }
   // D2H staging is only awaited when the chunk is posted, so it overlaps
   // with the CTA phases of the chunks prepared after it.
-  MSCCLPP_CUDATHROW(cudaEventRecord(c.postEvents[s], c.streams[0]));
-  return w;
+  MSCCLPP_CUDATHROW(cudaEventRecord(c.postEvents[s],
+                                    c.streams[liteRsHierarchical(p) ? 2 : 0]));
 }
 
 // Posts the prepared chunk's remote-owned partial. Non-eager pipelines post
@@ -290,7 +333,7 @@ static void liteRsNetwork(LiteReduceScatterContext& c, LiteTask const& task,
                           LiteReduceScatterPlan const& p) {
   auto totalBegin = std::chrono::steady_clock::now();
   LiteRsChunk pending[5]{};
-  size_t prepared = 0, posted = 0, finished = 0;
+  size_t prepared = 0, posted = 0, finished = 0, begun = 0;
   size_t chunks = (task.bytes - 1) / p.chunkBytes + 1;
   uint64_t epoch = ++c.epoch;  // one epoch per collective call
   auto postUpTo = [&](size_t n) {
@@ -308,10 +351,23 @@ static void liteRsNetwork(LiteReduceScatterContext& c, LiteTask const& task,
   // paths.
   for (size_t i = 0; i < chunks; ++i) {
     if (i >= c.slots) finishUpTo(i - c.slots + 1);
+    if (begun <= i) {
+      pending[i % c.slots] =
+          liteRsBeginNetworkChunk(c, task, p, i * p.chunkBytes, epoch, i);
+      begun = i + 1;
+    }
+    // Start the next chunk's partner-row copy before this chunk's CTA phases;
+    // that needs the next slot free, so the oldest chunk is finished first
+    // (one chunk less lead than the CPU pipeline on a full ring).
+    if (liteRsHierarchical(p) && i + 1 < chunks) {
+      if (i + 2 > c.slots) finishUpTo(i + 2 - c.slots);
+      pending[(i + 1) % c.slots] = liteRsBeginNetworkChunk(
+          c, task, p, (i + 1) * p.chunkBytes, epoch, i + 1);
+      begun = i + 2;
+    }
     for (size_t j = finished; j < prepared; ++j)
       liteRsPrefetch(c, p, pending[j % c.slots]);
-    pending[i % c.slots] =
-        liteRsPrepareNetworkChunk(c, task, p, i * p.chunkBytes, epoch, i);
+    liteRsPrepareNetworkChunk(c, task, p, pending[i % c.slots]);
     ++prepared;
     size_t target = prepared > p.lead ? prepared - p.lead : 0;
     if (p.eagerPost)

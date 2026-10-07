@@ -182,6 +182,19 @@ rank has its own connection to the same-local-rank peer on the other node.
   local partial and do the final add on the CPU. Defaults are in the pipeline policy
   table below.
 
+## Hierarchical pair copy overlap
+
+A trace of 2n×2g at 64 MiB (64 chunks, per call, µs) showed the stages running back to back:
+partner-row copy 7100, two CTA adds 2977 + 2949, wait for the peer 4293, H2D 3159, final add 2608
+(total 23688, 0.68x of NCCL). The copy runs at the PCIe peer-to-peer rate, so it cannot get
+faster, only hidden. The CPU pipeline queues copies and kernels on a stream; the service thread
+used to wait for each copy before the CTA phases. `liteRsBeginNetworkChunk` now takes the slot and
+issues the partner-row copy (event `pairEvents`), and `liteRsNetwork` begins chunk i+1 before it
+prepares chunk i, so the copy of chunk i+1 overlaps the CTA adds of chunk i. The D2H of the remote
+partial moved to its own stream so the next copy does not queue behind it. Beginning chunk i+1 needs
+its slot free, so the oldest chunk is finished first: with four slots the effective lead is one
+chunk less than the CPU class value. Untested.
+
 ## RDMA posting
 
 All two-node RDMA goes through the queue pair of each connection directly, like the CPU
