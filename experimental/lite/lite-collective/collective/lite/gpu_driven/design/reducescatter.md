@@ -193,7 +193,10 @@ issues the partner-row copy (event `pairEvents`), and `liteRsNetwork` begins chu
 prepares chunk i, so the copy of chunk i+1 overlaps the CTA adds of chunk i. The D2H of the remote
 partial moved to its own stream so the next copy does not queue behind it. Beginning chunk i+1 needs
 its slot free, so the oldest chunk is finished first: with four slots the effective lead is one
-chunk less than the CPU class value. Untested.
+chunk less than the CPU class value. Not used with `mapped_send` (1 MiB): the CTA writes the
+remote partial over PCIe and the concurrent copy made that case slower (0.73x → 0.51x).
+Measured: 4 MiB 0.72x → 0.84x, 16 MiB 0.67x → 0.78x, 64 MiB 0.68x → 0.78x; `pair_copy` fell from
+7102 to 375 µs but the CTA adds grew (2977/2949 → 4027/4820 µs), so the CTA is now the bottleneck.
 
 ## RDMA posting
 

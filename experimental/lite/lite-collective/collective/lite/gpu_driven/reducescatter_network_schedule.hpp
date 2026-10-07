@@ -359,7 +359,9 @@ static void liteRsNetwork(LiteReduceScatterContext& c, LiteTask const& task,
     // Start the next chunk's partner-row copy before this chunk's CTA phases;
     // that needs the next slot free, so the oldest chunk is finished first
     // (one chunk less lead than the CPU pipeline on a full ring).
-    if (liteRsHierarchical(p) && i + 1 < chunks) {
+    // Not with mapped_send: the CTA then writes the remote partial over PCIe
+    // while the copy runs, which made the 1 MiB case slower.
+    if (liteRsHierarchical(p) && !p.mappedSend && i + 1 < chunks) {
       if (i + 2 > c.slots) finishUpTo(i + 2 - c.slots);
       pending[(i + 1) % c.slots] = liteRsBeginNetworkChunk(
           c, task, p, (i + 1) * p.chunkBytes, epoch, i + 1);
