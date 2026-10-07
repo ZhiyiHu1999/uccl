@@ -93,7 +93,7 @@ __device__ unsigned char byteValue(int rank, size_t index, int iteration) {
 
 // The bench kernels inline every collective path; the bound keeps their register
 // use low enough to launch kBenchMaxThreads threads.
-static constexpr int kBenchMaxThreads = 1024;
+static constexpr int kBenchMaxThreads = 512;
 static constexpr int kBenchDefaultThreads = 512;
 
 // Repeated calls inside ONE kernel exercise the actual device-callable API,
@@ -227,7 +227,7 @@ static void debugProbeHandle(mscclppDeviceCollectiveHandle_t const& handle,
 
 // Threads of the single participating CTA. The SM budget is one CTA; the thread
 // count only changes how much memory-level parallelism that CTA has. Override
-// with UCCL_GPU_DRIVEN_BENCH_THREADS (multiple of 32, at most 1024).
+// with UCCL_GPU_DRIVEN_BENCH_THREADS (multiple of 32, at most 512).
 static int benchThreads() {
   static int threads = [] {
     char const* value = std::getenv("UCCL_GPU_DRIVEN_BENCH_THREADS");
