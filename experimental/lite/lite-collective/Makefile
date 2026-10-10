@@ -1,9 +1,22 @@
+# Build in parallel by default (the CUDA translation units dominate build time).
+# Only the top-level make sets it, and not when the caller already passed -j.
+# JOBS=N overrides the job count (capped at 16 by default, nvcc needs memory);
+# JOBS=1 builds serially.
+JOBS ?= $(shell n=$$(nproc 2>/dev/null || echo 4); [ $$n -gt 16 ] && n=16; echo $$n)
+ifeq ($(MAKELEVEL)$(findstring -j,$(MAKEFLAGS)),0)
+MAKEFLAGS += -j$(JOBS)
+endif
+
 CXX       ?= g++
 NVCC      ?= nvcc
 AR        ?= ar
 
 CUDA_HOME ?= /usr/local/cuda
-CUDA_ARCH ?= 80 90 100
+# Default to the architectures of the GPUs in this machine (nvidia-smi)；
+# Fall back to a fat build when none can be queried.
+# Override with CUDA_ARCH="80 89 90" (space separated). 
+# A stamp file rebuilds the CUDA objects when the architecture list changes.
+CUDA_ARCH ?= $(or $(strip $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr -d '. \r' | sort -u | tr '\n' ' ')),80 90 100)
 
 CXX_STD   := -std=c++17
 CXXFLAGS  := $(CXX_STD) -Wall -Wextra -fPIC -O2
@@ -16,6 +29,9 @@ LDFLAGS   := -L$(CUDA_HOME)/lib64
 LDLIBS    := -lcudart -lcuda -libverbs -lnuma -lpthread -ldl -lstdc++fs
 
 BUILD_DIR := build
+
+ARCH_STAMP := $(BUILD_DIR)/.cuda_arch
+$(shell mkdir -p $(BUILD_DIR); echo "$(CUDA_ARCH)" | cmp -s - $(ARCH_STAMP) 2>/dev/null || echo "$(CUDA_ARCH)" > $(ARCH_STAMP))
 
 # --- Core infra (core/) ---
 CORE_CC_SRCS  := $(wildcard core/*.cc)
@@ -60,7 +76,7 @@ $(BUILD_DIR)/core/%.o: core/%.cc | $(BUILD_DIR)/core
 $(BUILD_DIR)/core/%.o: core/%.cpp | $(BUILD_DIR)/core
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $(DEFINES) -c $< -o $@
 
-$(BUILD_DIR)/core/%.cu.o: core/%.cu | $(BUILD_DIR)/core
+$(BUILD_DIR)/core/%.cu.o: core/%.cu $(ARCH_STAMP) | $(BUILD_DIR)/core
 	$(NVCC) $(CUFLAGS) $(NVCC_GENCODE) $(INCLUDES) $(DEFINES) -c $< -o $@
 
 # Collective library compilation rules
@@ -68,7 +84,7 @@ $(BUILD_DIR)/collective/%.o: collective/%.cc | $(BUILD_DIR)/collective
 	mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $(DEFINES) -c $< -o $@
 
-$(BUILD_DIR)/collective/%.cu.o: collective/%.cu | $(BUILD_DIR)/collective
+$(BUILD_DIR)/collective/%.cu.o: collective/%.cu $(ARCH_STAMP) | $(BUILD_DIR)/collective
 	$(NVCC) $(CUFLAGS) $(NVCC_GENCODE) $(INCLUDES) $(DEFINES) -c $< -o $@
 
 # Core library
